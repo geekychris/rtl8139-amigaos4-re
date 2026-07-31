@@ -1,0 +1,7 @@
+build/
+*.o
+*.a
+*.device
+*.exe
+.DS_Store
+.idea/
