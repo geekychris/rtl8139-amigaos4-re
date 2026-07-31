@@ -159,6 +159,14 @@ static void v_cleanup(struct Rtl8139ReBase *base)
     if (base->IExpansion)   { IExec->DropInterface((struct Interface *)base->IExpansion); base->IExpansion = NULL; }
     if (base->IDOS)         { IExec->DropInterface((struct Interface *)base->IDOS); base->IDOS = NULL; }
 
+    /* Free PCI device first (needs IPCI which we drop above; move
+     * up if that ordering matters — original drops device before
+     * dropping IPCI, so free here BEFORE those go away. Reordering: */
+    if (base->pciDevice && base->IPCI) {
+        base->IPCI->FreeDevice(base->pciDevice);
+        base->pciDevice = NULL;
+    }
+
     if (base->UtilityBase)  { IExec->CloseLibrary(base->UtilityBase); base->UtilityBase = NULL; }
     if (base->ExpansionBase){ IExec->CloseLibrary(base->ExpansionBase); base->ExpansionBase = NULL; }
     if (base->DOSBase)      { IExec->CloseLibrary(base->DOSBase); base->DOSBase = NULL; }
@@ -243,8 +251,37 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
     APTR nmem = iexec->OpenResource("newmemory.resource");
     base->has_newmemory = (nmem != NULL) ? 1 : 0;
 
+    /* Phase B: walk the vendor:device table and grab the first
+     * matching PCI device. The original does this per-unit inside
+     * DevOpen (0x1000864), but for a single-unit driver on QEMU we
+     * can do it once at Init. If found: base->pciDevice is set and
+     * Open on unit 0 will succeed. */
+    for (const struct Rtl8139DeviceID *id = rtl8139_device_ids;
+         id->vendor != 0xFFFF; id++) {
+        struct PCIDevice *pd = base->IPCI->FindDeviceTags(
+            FDT_VendorID, id->vendor,
+            FDT_DeviceID, id->device,
+            FDT_Index,    (ULONG)0,
+            TAG_END);
+        if (pd) {
+            base->pciDevice = pd;
+            base->pci_vendor = id->vendor;
+            base->pci_device = id->device;
+            iexec->DebugPrintF("[rtl8139re] Found PCI device %04lx:%04lx\n",
+                               (unsigned long)id->vendor,
+                               (unsigned long)id->device);
+            break;
+        }
+    }
+    if (!base->pciDevice) {
+        iexec->DebugPrintF("[rtl8139re] No matching RTL8139-family "
+                           "PCI device found — device will load but "
+                           "OpenDevice on unit 0 will fail\n");
+    }
+
     iexec->DebugPrintF("[rtl8139re] Init OK: libs+ifaces bound, "
-                       "has_newmemory=%d\n", (int)base->has_newmemory);
+                       "has_newmemory=%d, pciDevice=%p\n",
+                       (int)base->has_newmemory, base->pciDevice);
     return (struct Library *)base;
 
 fail:
@@ -277,6 +314,12 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
 
     /* Original rejects unit > 7. Bridge tests use unit 0. */
     if (unitNum > 7) {
+        ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        return NULL;
+    }
+
+    /* Phase B: refuse if no PCI device was found at Init. */
+    if (!base->pciDevice) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
         return NULL;
     }
