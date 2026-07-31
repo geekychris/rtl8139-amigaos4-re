@@ -62,12 +62,50 @@ struct Rtl8139ReBase
     UBYTE              has_newmemory;    /* @168 originally - kept as flag */
     UBYTE              _pad_1[3];
 
-    /* PCI plumbing — Phase C will populate these once the RTL8139 is
-     * enumerated. NULL until then. */
+    /* PCI plumbing — Phase B populates pciDevice + vendor/device. */
     struct PCIDevice  *pciDevice;
     ULONG              pci_vendor;
     ULONG              pci_device;
+
+    /* Phase C: BAR + MAC. RTL8139 exposes BAR0 as an I/O-port range
+     * (16 bytes wide) and BAR1 as memory-mapped mirror of the same
+     * registers. The Hyperion binary uses BAR0 (I/O) via
+     * PCIDevice.InLong/OutLong, which auto-byteswaps on PPC. We do
+     * the same. Original stores bar_io at unit+192 in the per-unit
+     * struct; we hang it off the driver base for now since we're
+     * still single-unit. */
+    ULONG              bar_io;              /* io_base for PCIDevice.InLong/OutLong */
+    struct PCIResourceRange *bar_range;     /* keep so we can FreeResourceRange */
+
+    /* MAC address read from IDR0-5 at Init time. Serves
+     * S2_GETSTATIONADDRESS + fills the outgoing frame src MAC. */
+    UBYTE              mac[6];
+    UBYTE              _pad_mac[2];
+    BOOL               hw_present;          /* TRUE iff BAR + MAC read OK */
 };
+
+/* RTL8139 register offsets (from BAR I/O base). Full spec in the
+ * Realtek datasheet; we replicate what the original binary uses. */
+#define RTL_IDR0   0x00
+#define RTL_IDR4   0x04
+#define RTL_MAR0   0x08
+#define RTL_TSD0   0x10   /* Transmit Status of Descriptor 0..3 */
+#define RTL_TSAD0  0x20   /* Transmit Start Addr of Descriptor 0..3 */
+#define RTL_RBSTART 0x30
+#define RTL_ERBCR  0x34
+#define RTL_CR     0x37   /* Command Register (byte) */
+#define RTL_CAPR   0x38
+#define RTL_CBR    0x3A
+#define RTL_IMR    0x3C   /* Interrupt Mask (word) */
+#define RTL_ISR    0x3E   /* Interrupt Status (word) */
+#define RTL_TCR    0x40   /* Transmit Config */
+#define RTL_RCR    0x44   /* Receive Config */
+#define RTL_9346CR 0x50   /* EEPROM Command */
+
+/* Command Register bits (write byte to CR) */
+#define RTL_CR_TE  0x04
+#define RTL_CR_RE  0x08
+#define RTL_CR_RST 0x10
 
 /* Vendor:Device pairs the driver matches. Sourced from the rodata table
  * at 0x100a370 of the original binary — 16 entries + 0xFFFFFFFF

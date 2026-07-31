@@ -82,6 +82,20 @@ int main(int argc, char **argv)
     IDOS->Printf("NSCMD_DEVICEQUERY: DoIO=%ld io_Error=%ld\n",
                  (long)rc, (long)req->ios2_Req.io_Error);
 
+    /* S2_GETSTATIONADDRESS: retrieve the MAC our driver read from
+     * IDR0/IDR4. Fills ios2_SrcAddr[0..5] (HW MAC) and _DstAddr. */
+    for (int i = 0; i < 6; i++) {
+        req->ios2_SrcAddr[i] = 0;
+        req->ios2_DstAddr[i] = 0;
+    }
+    req->ios2_Req.io_Command = S2_GETSTATIONADDRESS;
+    req->ios2_Req.io_Error   = 0;
+    LONG rc2 = IExec->DoIO((struct IORequest *)req);
+    IDOS->Printf("S2_GETSTATIONADDRESS: DoIO=%ld io_Error=%ld MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 (long)rc2, (long)req->ios2_Req.io_Error,
+                 req->ios2_SrcAddr[0], req->ios2_SrcAddr[1], req->ios2_SrcAddr[2],
+                 req->ios2_SrcAddr[3], req->ios2_SrcAddr[4], req->ios2_SrcAddr[5]);
+
     IExec->CloseDevice((struct IORequest *)req);
     IExec->FreeSysObject(ASOT_IOREQUEST, req);
     IExec->FreeSysObject(ASOT_PORT, port);

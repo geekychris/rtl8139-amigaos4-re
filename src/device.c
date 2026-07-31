@@ -162,6 +162,11 @@ static void v_cleanup(struct Rtl8139ReBase *base)
     /* Free PCI device first (needs IPCI which we drop above; move
      * up if that ordering matters — original drops device before
      * dropping IPCI, so free here BEFORE those go away. Reordering: */
+    if (base->bar_range && base->pciDevice) {
+        base->pciDevice->FreeResourceRange(base->bar_range);
+        base->bar_range = NULL;
+        base->bar_io = 0;
+    }
     if (base->pciDevice && base->IPCI) {
         base->IPCI->FreeDevice(base->pciDevice);
         base->pciDevice = NULL;
@@ -279,9 +284,76 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
                            "OpenDevice on unit 0 will fail\n");
     }
 
+    /* Phase C: bring the chip's registers within reach + read the MAC.
+     *
+     * The original does this per-unit inside DevOpen (PopulateUnitPCI
+     * + ChipStart). Since we're single-unit, do it once here at Init;
+     * cleaner and simpler.
+     *
+     * Steps:
+     *   1. GetResourceRange(0) → BAR0 (I/O port range for RTL8139)
+     *   2. Set PCI command bits (BUSMASTER | IO_ENABLE) via
+     *      WriteConfigLong(PCI_COMMAND, ...)
+     *   3. Read MAC via InLong(BAR+IDR0) + InLong(BAR+IDR4). QEMU
+     *      pre-seeds IDR0-5 from the -device mac= param (or default
+     *      52:54:00:12:34:57 on n0).
+     *
+     * PCIDevice.InLong / OutLong auto-byteswap on PPC — the OS4 PCI
+     * stack knows the bus is LE. So the ULONG we get back is
+     * "already in host order" for the fields the RTL treats as
+     * bytes — but the MAC comes back as a little-endian ULONG that
+     * we need to break into bytes in that same LE order. That
+     * matches WriteMacToChip's byteswap-on-write pattern in reverse.
+     */
+    if (base->pciDevice) {
+        base->bar_range = base->pciDevice->GetResourceRange(0);
+        if (base->bar_range) {
+            base->bar_io = base->bar_range->BaseAddress;
+            iexec->DebugPrintF("[rtl8139re] BAR0 base=%08lx size=%lu flags=%08lx\n",
+                               (unsigned long)base->bar_io,
+                               (unsigned long)base->bar_range->Size,
+                               (unsigned long)base->bar_range->Flags);
+
+            /* Enable BUSMASTER + IO in PCI command register. Standard
+             * PCI bring-up; without this the NIC won't respond to
+             * I/O accesses. Command reg = 0x04, low 16 bits are the
+             * command bits. */
+            ULONG cmd = base->pciDevice->ReadConfigLong(0x04);
+            cmd |= 0x00000007;    /* IO | MEM | BUSMASTER (low 3 bits) */
+            base->pciDevice->WriteConfigLong(0x04, cmd);
+            iexec->DebugPrintF("[rtl8139re] PCI cmd/status = %08lx (after set)\n",
+                               (unsigned long)cmd);
+
+            /* Read MAC. Note: on this test setup, Hyperion's shipping
+             * rtl8139.device is bound to the SAME NIC and actively
+             * DMA'ing, so IDR0-5 reads race with its state. We
+             * observed 00:52:00:54:00:00 for a NIC whose real MAC is
+             * 52:54:00:12:34:57 — a stride-2 pattern that suggests
+             * word-lane issues or a stale hardware state under
+             * concurrent access.
+             *
+             * Once we have a dedicated NIC (adding a second rtl8139
+             * to QEMU config, or unloading the shipping driver
+             * first), MAC read will be reliable via either
+             * InLong(BAR+0)+InLong(BAR+4) or 6× InByte. */
+            for (int i = 0; i < 6; i++) {
+                base->mac[i] = base->pciDevice->InByte(base->bar_io + i);
+            }
+            iexec->DebugPrintF("[rtl8139re] MAC read = %02x:%02x:%02x:%02x:%02x:%02x "
+                               "(may be unreliable — see caveat in Phase C)\n",
+                               base->mac[0], base->mac[1], base->mac[2],
+                               base->mac[3], base->mac[4], base->mac[5]);
+
+            base->hw_present = TRUE;
+        } else {
+            iexec->DebugPrintF("[rtl8139re] GetResourceRange(0) FAILED\n");
+        }
+    }
+
     iexec->DebugPrintF("[rtl8139re] Init OK: libs+ifaces bound, "
-                       "has_newmemory=%d, pciDevice=%p\n",
-                       (int)base->has_newmemory, base->pciDevice);
+                       "has_newmemory=%d, pciDevice=%p hw=%d\n",
+                       (int)base->has_newmemory, base->pciDevice,
+                       (int)base->hw_present);
     return (struct Library *)base;
 
 fail:
@@ -376,8 +448,30 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
     struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
     ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
     ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
-    ioreq->ios2_Req.io_Error = IOERR_NOCMD;
+    ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
+
+    /* Phase C: implement S2_GETSTATIONADDRESS so tests can retrieve
+     * the MAC read at Init. Fills ios2_SrcAddr (HW MAC) and
+     * ios2_DstAddr (current MAC — same as HW since we don't rewrite). */
+    switch (ioreq->ios2_Req.io_Command) {
+    case S2_GETSTATIONADDRESS: {
+        if (!base->hw_present) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+        } else {
+            for (int i = 0; i < 6; i++) {
+                ioreq->ios2_SrcAddr[i] = base->mac[i];
+                ioreq->ios2_DstAddr[i] = base->mac[i];
+            }
+        }
+        break;
+    }
+    default:
+        ioreq->ios2_Req.io_Error = IOERR_NOCMD;
+        break;
+    }
+
     base->IExec->ReplyMsg((struct Message *)ioreq);
 }
 
