@@ -1,18 +1,15 @@
 /*
  * rtl8139re.device — C reconstruction of Hyperion's rtl8139.device 53.4.
  *
- * PHASE 0 — SKELETON.
+ * PHASE A — library init + cleanup + expunge.
  *
- * Enough of an OS4 SANA-II device to load, be OpenDevice'd, and reply
- * IOERR_NOCMD to every request. No PCI, no hardware, no dispatch — just
- * the resident-tag glue so we can prove the docker → push → load cycle.
+ * Translates DevInit (rtl.asm 0x100023c, 684 bytes) and DevCleanup
+ * (0x100016c, 208 bytes). DevExpunge (0x10004e8, 196 bytes) and
+ * DevAbortIO (0x100007c, 240 bytes) also included since they're small
+ * and referenced from the AutoInit function table.
  *
- * Structure lifted from virte1000/src/device.c (same author's e1000 driver
- * work) which had the OS4-native resident-tag layout, 68k jump table,
- * DeviceManagerInterface vector table, and RTF_AUTOINIT semantics all
- * ironed out. Each subsequent phase (A, B, C, ...) will pull in one
- * chunk of translated behavior from the RE'd rtl.asm at
- * /Users/chris/tmp_bsd/rtl.asm.
+ * See docs/FUNCTION_MAP.md for the full map. Struct layout in
+ * include/rtl8139re.h.
  */
 
 #include "rtl8139re.h"
@@ -23,26 +20,36 @@
 #include <exec/resident.h>
 #include <exec/errors.h>
 #include <exec/execbase.h>
+#include <exec/ports.h>
 
 #include <devices/newstyle.h>
 
 #include <dos/dos.h>
 #include <interfaces/dos.h>
 
-#include <exec/ports.h>
-
 #include <stdarg.h>
 #include <stddef.h>
 
 #define DEVNAME           "rtl8139re.device"
-#define DEVVER            0
-#define DEVREV            1
+#define DEVVER            53
+#define DEVREV            4
 #define DEVVERSIONSTRING  VSTRING
 
 /*
- * Manager Obtain/Release — reference count on the interface. Standard
- * OS4 idiom; every device driver's manager interface has this.
+ * The RTL8139 vendor:device ID table from the original binary's rodata
+ * at 0x100a370. 16 real entries + a 0xFFFFFFFF terminator. Order matters
+ * only for the search itself; leaving it identical for byte-compat.
  */
+const struct Rtl8139DeviceID rtl8139_device_ids[] = {
+    {0x10EC, 0x8139}, {0x10EC, 0x8138}, {0x1113, 0x1211}, {0x1500, 0x1360},
+    {0x4033, 0x1360}, {0x1186, 0x1300}, {0x1186, 0x1340}, {0x13D1, 0xAB06},
+    {0x1259, 0xA117}, {0x1259, 0xA11E}, {0x14EA, 0xAB06}, {0x14EA, 0xAB07},
+    {0x11DB, 0x1234}, {0x1432, 0x9130}, {0x02AC, 0x1012}, {0x018A, 0x0106},
+    {0x126C, 0x1211}, {0x1743, 0x8139}, {0x021B, 0x8139},
+    {0xFFFF, 0xFFFF},   /* terminator */
+};
+
+/* Interface refcount helpers — standard OS4 idiom. */
 uint32 _manager_Obtain(struct DeviceManagerInterface *Self)
 {
     Self->Data.RefCount++;
@@ -69,17 +76,15 @@ extern void _manager_BeginIO(struct DeviceManagerInterface *Self,
 extern LONG _manager_AbortIO(struct DeviceManagerInterface *Self,
                              struct IOSana2Req *ioreq);
 
-/* OS4 vector table for DeviceManagerInterface. Order and terminator are
- * mandated by exec/interfaces.h — do not reorder. */
 static const APTR _manager_Vectors[] = {
     (APTR)_manager_Obtain,
     (APTR)_manager_Release,
-    (APTR)NULL,             /* Expunge-slot on Interface — unused */
-    (APTR)NULL,             /* Clone — unused */
+    (APTR)NULL,
+    (APTR)NULL,
     (APTR)_manager_Open,
     (APTR)_manager_Close,
     (APTR)_manager_Expunge,
-    (APTR)NULL,             /* Reserved */
+    (APTR)NULL,
     (APTR)_manager_BeginIO,
     (APTR)_manager_AbortIO,
     (APTR)-1,
@@ -94,23 +99,18 @@ static const struct TagItem _manager_Tags[] = {
 
 const APTR devInterfaces[] = { (APTR)_manager_Tags, (APTR)NULL };
 
-/* 68k-compat jump table. Every shipping OS4 .device includes this to
- * support classic-Amiga callers that go through negative library
- * offsets. Costs nothing to include. */
 static const APTR _manager_Vectors68K[] = {
-    (APTR)_manager_Open,     /* -6  */
-    (APTR)_manager_Close,    /* -12 */
-    (APTR)_manager_Expunge,  /* -18 */
-    (APTR)NULL,              /* -24 Reserved */
-    (APTR)_manager_BeginIO,  /* -30 */
-    (APTR)_manager_AbortIO,  /* -36 */
+    (APTR)_manager_Open,
+    (APTR)_manager_Close,
+    (APTR)_manager_Expunge,
+    (APTR)NULL,
+    (APTR)_manager_BeginIO,
+    (APTR)_manager_AbortIO,
     (APTR)-1,
 };
 
-/* Version cookie for the AmigaDOS `Version` command. */
 static const char verstag[] __attribute__((used)) = "\0$VER: " DEVVERSIONSTRING;
 
-/* Init tag list — CLT_DataSize tells the kernel how big our libBase is. */
 static struct TagItem dev_init_tags[] = {
     {CLT_DataSize,     sizeof(struct Rtl8139ReBase)},
     {CLT_Interfaces,   (ULONG)devInterfaces},
@@ -120,9 +120,6 @@ static struct TagItem dev_init_tags[] = {
     {TAG_END,          0},
 };
 
-/* Resident struct — NOT const. Every working OS4 kickstart device
- * places this in writable .data because the kernel/DOS may patch
- * fields during boot binding. */
 static struct Resident dev_res __attribute__((used)) = {
     RTC_MATCHWORD,
     (struct Resident *)&dev_res,
@@ -136,7 +133,6 @@ static struct Resident dev_res __attribute__((used)) = {
     (APTR)dev_init_tags,
 };
 
-/* Shell entry point. Not runnable — print a hint and exit. */
 int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 {
     (void)argstring; (void)arglen;
@@ -147,49 +143,162 @@ int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 }
 
 /* ------------------------------------------------------------------- */
-/* Init / Open / Close / Expunge / BeginIO / AbortIO — Phase 0 stubs   */
+/* Cleanup — reverse of what DevInit + DevOpen have set up so far.     */
+/*                                                                      */
+/* Original: 0x100016c, 208 bytes. Drops 4 interfaces + closes 4 libs. */
+/* We use per-field NULL checks so callers can invoke it at any point  */
+/* during Init to roll back a partial success.                         */
+/* ------------------------------------------------------------------- */
+
+static void v_cleanup(struct Rtl8139ReBase *base)
+{
+    struct ExecIFace *IExec = base->IExec;
+
+    if (base->IPCI)         { IExec->DropInterface((struct Interface *)base->IPCI); base->IPCI = NULL; }
+    if (base->IUtility)     { IExec->DropInterface((struct Interface *)base->IUtility); base->IUtility = NULL; }
+    if (base->IExpansion)   { IExec->DropInterface((struct Interface *)base->IExpansion); base->IExpansion = NULL; }
+    if (base->IDOS)         { IExec->DropInterface((struct Interface *)base->IDOS); base->IDOS = NULL; }
+
+    if (base->UtilityBase)  { IExec->CloseLibrary(base->UtilityBase); base->UtilityBase = NULL; }
+    if (base->ExpansionBase){ IExec->CloseLibrary(base->ExpansionBase); base->ExpansionBase = NULL; }
+    if (base->DOSBase)      { IExec->CloseLibrary(base->DOSBase); base->DOSBase = NULL; }
+
+    if (base->io_lock)      { IExec->FreeSysObject(ASOT_SEMAPHORE, base->io_lock); base->io_lock = NULL; }
+}
+
+/* ------------------------------------------------------------------- */
+/* Init — the AutoInit hook, called by exec when the resident tag is  */
+/* first processed. Sets library metadata, opens dos/expansion/utility */
+/* + their "main" interfaces, gets IPCI, probes newmemory.resource.    */
+/* On any library failure: DevCleanup and return the library base      */
+/* anyway (letting exec put us in the library list — Expunge will      */
+/* handle removal). The original returns 0 on total failure; a         */
+/* partial-success base is fine, since Open will re-check.             */
+/* Original: 0x100023c, 684 bytes.                                     */
 /* ------------------------------------------------------------------- */
 
 struct Library *_manager_Init(struct Library *library, BPTR seglist,
                               struct Interface *exec)
 {
-    struct Rtl8139ReBase *devBase = (struct Rtl8139ReBase *)library;
+    struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)library;
     struct ExecIFace *iexec = (struct ExecIFace *)exec;
 
-    devBase->IExec       = iexec;
-    devBase->dev_SegList = (ULONG)seglist;
+    base->IExec       = iexec;
+    base->dev_SegList = (ULONG)seglist;
+
+    /* Library metadata — original sets ln_Type=NT_DEVICE, ln_Pri=0,
+     * lib_Flags=6 (SUMUSED | CHANGED), lib_Version=53, lib_Revision=4,
+     * lib_Node.ln_Name = "rtl8139.device", lib_IdString = VSTRING.
+     * The kernel does most of this from the resident tag, but the
+     * original hand-fills to be sure. */
+    base->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
+    base->dev_Base.dd_Library.lib_Node.ln_Name = (STRPTR)DEVNAME;
+    base->dev_Base.dd_Library.lib_Node.ln_Pri  = 0;
+    base->dev_Base.dd_Library.lib_Version      = DEVVER;
+    base->dev_Base.dd_Library.lib_Revision     = DEVREV;
+    base->dev_Base.dd_Library.lib_IdString     = (STRPTR)DEVVERSIONSTRING;
 
     iexec->DebugPrintF("[rtl8139re] Init: DevBase=%p sizeof=%lu\n",
-                       devBase, (unsigned long)sizeof(*devBase));
+                       base, (unsigned long)sizeof(*base));
 
-    /* Real init (Phase A onwards) will open dos/expansion/utility, get
-     * their interfaces, then find the RTL8139 PCI device. For Phase 0
-     * we just return so OpenDevice can succeed. */
-    return (struct Library *)devBase;
+    /* IO lock — AllocSysObject(ASOT_SEMAPHORE). Guards openers list
+     * and unit table (Phase B). Original stores at r31+40. */
+    base->io_lock = iexec->AllocSysObject(ASOT_SEMAPHORE, NULL);
+
+    /* Open the three libraries. If any fails, cleanup + still return
+     * the base — Open will notice and reject. dos.library at v51 is
+     * the standard OS4 minimum. */
+    base->DOSBase = iexec->OpenLibrary("dos.library", 51);
+    if (!base->DOSBase) goto fail;
+
+    base->ExpansionBase = iexec->OpenLibrary("expansion.library", 51);
+    if (!base->ExpansionBase) goto fail;
+
+    base->UtilityBase = iexec->OpenLibrary("utility.library", 51);
+    if (!base->UtilityBase) goto fail;
+
+    /* Get "main" interfaces (v1). The original names these all the
+     * same string constant ("main") from rodata 0x100a144. */
+    base->IDOS = (struct DOSIFace *)iexec->GetInterface(
+        base->DOSBase, "main", 1, NULL);
+    if (!base->IDOS) goto fail;
+
+    base->IExpansion = (struct ExpansionIFace *)iexec->GetInterface(
+        base->ExpansionBase, "main", 1, NULL);
+    if (!base->IExpansion) goto fail;
+
+    base->IUtility = (struct UtilityIFace *)iexec->GetInterface(
+        base->UtilityBase, "main", 1, NULL);
+    if (!base->IUtility) goto fail;
+
+    /* Get IPCI — the "pci" interface on expansion.library. Original
+     * uses this for FindDeviceTags in DevOpen. */
+    base->IPCI = (struct PCIIFace *)iexec->GetInterface(
+        base->ExpansionBase, "pci", 1, NULL);
+    if (!base->IPCI) goto fail;
+
+    /* Probe newmemory.resource. Original stores a boolean at
+     * r31+168 — TRUE if the resource is available. We mirror that
+     * flag but nothing else in the current phase uses it. */
+    APTR nmem = iexec->OpenResource("newmemory.resource");
+    base->has_newmemory = (nmem != NULL) ? 1 : 0;
+
+    iexec->DebugPrintF("[rtl8139re] Init OK: libs+ifaces bound, "
+                       "has_newmemory=%d\n", (int)base->has_newmemory);
+    return (struct Library *)base;
+
+fail:
+    iexec->DebugPrintF("[rtl8139re] Init: library/interface open failed — "
+                       "cleaning up but keeping base\n");
+    v_cleanup(base);
+    /* Return the base anyway; Open will refuse. The original does the
+     * same — DevCleanup then tail returns the library. */
+    return (struct Library *)base;
 }
+
+/* ------------------------------------------------------------------- */
+/* Open / Close / Expunge — Phase A stubs; Phase B adds unit setup.   */
+/* ------------------------------------------------------------------- */
 
 struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
                                     struct IOSana2Req *ioreq,
                                     ULONG unitNum, ULONG flags)
 {
-    (void)flags; (void)unitNum;
-    struct Rtl8139ReBase *devBase = (struct Rtl8139ReBase *)Self->Data.LibBase;
-    devBase->dev_Base.dd_Library.lib_OpenCnt++;
-    devBase->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
+    (void)flags;
+    struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
+
+    /* Refuse if Init didn't complete (any of the required libs/ifaces
+     * missing). Original checks by looking at a "ok" flag; we
+     * inspect the fields directly. */
+    if (!base->IDOS || !base->IExpansion || !base->IUtility || !base->IPCI) {
+        ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        return NULL;
+    }
+
+    /* Original rejects unit > 7. Bridge tests use unit 0. */
+    if (unitNum > 7) {
+        ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        return NULL;
+    }
+
+    base->dev_Base.dd_Library.lib_OpenCnt++;
+    base->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
     ioreq->ios2_Req.io_Error = 0;
-    ioreq->ios2_Req.io_Unit  = (struct Unit *)devBase;
-    return devBase;
+    ioreq->ios2_Req.io_Unit  = (struct Unit *)base;   /* Phase B will
+                                                       * return a per-unit
+                                                       * struct instead. */
+    return base;
 }
 
 BPTR _manager_Close(struct DeviceManagerInterface *Self,
                     struct IOSana2Req *ioreq)
 {
-    struct Rtl8139ReBase *devBase = (struct Rtl8139ReBase *)Self->Data.LibBase;
+    struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
     ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
     ioreq->ios2_Req.io_Device = (struct Device *)-1;
-    devBase->dev_Base.dd_Library.lib_OpenCnt--;
-    if (devBase->dev_Base.dd_Library.lib_OpenCnt == 0 &&
-        (devBase->dev_Base.dd_Library.lib_Flags & LIBF_DELEXP)) {
+    base->dev_Base.dd_Library.lib_OpenCnt--;
+    if (base->dev_Base.dd_Library.lib_OpenCnt == 0 &&
+        (base->dev_Base.dd_Library.lib_Flags & LIBF_DELEXP)) {
         return _manager_Expunge(Self);
     }
     return (BPTR)0;
@@ -197,36 +306,53 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self,
 
 BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
 {
-    struct Rtl8139ReBase *devBase = (struct Rtl8139ReBase *)Self->Data.LibBase;
-    if (devBase->dev_Base.dd_Library.lib_OpenCnt) {
-        devBase->dev_Base.dd_Library.lib_Flags |= LIBF_DELEXP;
+    struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
+    if (base->dev_Base.dd_Library.lib_OpenCnt) {
+        base->dev_Base.dd_Library.lib_Flags |= LIBF_DELEXP;
         return (BPTR)0;
     }
-    BPTR seg = (BPTR)devBase->dev_SegList;
-    struct ExecIFace *IExec = devBase->IExec;
-    IExec->Remove((struct Node *)&devBase->dev_Base.dd_Library.lib_Node);
-    IExec->DeleteLibrary((struct Library *)devBase);
+    BPTR seg = (BPTR)base->dev_SegList;
+    struct ExecIFace *IExec = base->IExec;
+    v_cleanup(base);
+    IExec->Remove((struct Node *)&base->dev_Base.dd_Library.lib_Node);
+    IExec->DeleteLibrary((struct Library *)base);
     return seg;
 }
+
+/* ------------------------------------------------------------------- */
+/* BeginIO / AbortIO — Phase A stubs.                                  */
+/*                                                                      */
+/* AbortIO original: 0x100007c, 240 bytes — canonical Amiga AbortIO.   */
+/* Under IExec.Disable, removes the IOReq from any queue, replies it,  */
+/* re-enables. Phase B (unit task) implements the queue.                */
+/* ------------------------------------------------------------------- */
 
 void _manager_BeginIO(struct DeviceManagerInterface *Self,
                       struct IOSana2Req *ioreq)
 {
-    (void)Self;
-    /* Phase 0 stub — reply IOERR_NOCMD for everything. Sana-II handlers
-     * arrive in later phases (C onwards). */
+    struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
     ioreq->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
     ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
     ioreq->ios2_Req.io_Error = IOERR_NOCMD;
     ioreq->ios2_WireError    = 0;
-    /* Reply immediately since no unit task exists yet. */
-    struct Rtl8139ReBase *devBase = (struct Rtl8139ReBase *)Self->Data.LibBase;
-    devBase->IExec->ReplyMsg((struct Message *)ioreq);
+    base->IExec->ReplyMsg((struct Message *)ioreq);
 }
 
 LONG _manager_AbortIO(struct DeviceManagerInterface *Self,
                       struct IOSana2Req *ioreq)
 {
-    (void)Self; (void)ioreq;
-    return IOERR_NOCMD;
+    struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
+    struct ExecIFace *IExec = base->IExec;
+
+    /* Original: Disable → Remove if node linked → ReplyMsg → Enable.
+     * Only performs Remove if the io is on a msg-port (ln_Type ==
+     * NT_MESSAGE) — otherwise it's already been replied or is quick. */
+    IExec->Disable();
+    if (ioreq->ios2_Req.io_Message.mn_Node.ln_Type == NT_MESSAGE) {
+        IExec->Remove(&ioreq->ios2_Req.io_Message.mn_Node);
+        ioreq->ios2_Req.io_Error = IOERR_ABORTED;
+        IExec->ReplyMsg((struct Message *)ioreq);
+    }
+    IExec->Enable();
+    return 0;
 }
