@@ -256,26 +256,27 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
     APTR nmem = iexec->OpenResource("newmemory.resource");
     base->has_newmemory = (nmem != NULL) ? 1 : 0;
 
-    /* Phase B: walk the vendor:device table and grab the first
-     * matching PCI device. The original does this per-unit inside
-     * DevOpen (0x1000864), but for a single-unit driver on QEMU we
-     * can do it once at Init. If found: base->pciDevice is set and
-     * Open on unit 0 will succeed. */
-    for (const struct Rtl8139DeviceID *id = rtl8139_device_ids;
-         id->vendor != 0xFFFF; id++) {
-        struct PCIDevice *pd = base->IPCI->FindDeviceTags(
-            FDT_VendorID, id->vendor,
-            FDT_DeviceID, id->device,
-            FDT_Index,    (ULONG)0,
-            TAG_END);
-        if (pd) {
-            base->pciDevice = pd;
-            base->pci_vendor = id->vendor;
-            base->pci_device = id->device;
-            iexec->DebugPrintF("[rtl8139re] Found PCI device %04lx:%04lx\n",
-                               (unsigned long)id->vendor,
-                               (unsigned long)id->device);
-            break;
+    /* Phase B: walk the vendor:device table and grab a matching PCI
+     * device. Prefer Index=1+ so we DON'T take the first rtl8139
+     * (owned by Hyperion's shipping driver + amiga-bridge on our
+     * test setup). Fall back to Index=0 if no second chip exists. */
+    for (int idx = 1; idx >= 0 && !base->pciDevice; idx--) {
+        for (const struct Rtl8139DeviceID *id = rtl8139_device_ids;
+             id->vendor != 0xFFFF; id++) {
+            struct PCIDevice *pd = base->IPCI->FindDeviceTags(
+                FDT_VendorID, id->vendor,
+                FDT_DeviceID, id->device,
+                FDT_Index,    (ULONG)idx,
+                TAG_END);
+            if (pd) {
+                base->pciDevice = pd;
+                base->pci_vendor = id->vendor;
+                base->pci_device = id->device;
+                iexec->DebugPrintF("[rtl8139re] Found PCI device %04lx:%04lx (Index=%d)\n",
+                                   (unsigned long)id->vendor,
+                                   (unsigned long)id->device, idx);
+                break;
+            }
         }
     }
     if (!base->pciDevice) {
@@ -324,23 +325,23 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
             iexec->DebugPrintF("[rtl8139re] PCI cmd/status = %08lx (after set)\n",
                                (unsigned long)cmd);
 
-            /* Read MAC. Note: on this test setup, Hyperion's shipping
-             * rtl8139.device is bound to the SAME NIC and actively
-             * DMA'ing, so IDR0-5 reads race with its state. We
-             * observed 00:52:00:54:00:00 for a NIC whose real MAC is
-             * 52:54:00:12:34:57 — a stride-2 pattern that suggests
-             * word-lane issues or a stale hardware state under
-             * concurrent access.
+            /* Read MAC via InLong. IMPORTANT: on OS4/sam460ex, PCIDevice.InByte
+             * returns garbled values for RTL8139 IDR registers — verified via
+             * comparison with InLong which returns the correct little-endian
+             * bytes. Use InLong exclusively for register reads.
              *
-             * Once we have a dedicated NIC (adding a second rtl8139
-             * to QEMU config, or unloading the shipping driver
-             * first), MAC read will be reliable via either
-             * InLong(BAR+0)+InLong(BAR+4) or 6× InByte. */
-            for (int i = 0; i < 6; i++) {
-                base->mac[i] = base->pciDevice->InByte(base->bar_io + i);
-            }
-            iexec->DebugPrintF("[rtl8139re] MAC read = %02x:%02x:%02x:%02x:%02x:%02x "
-                               "(may be unreliable — see caveat in Phase C)\n",
+             * PCIDevice.InLong returns a ULONG whose low byte = IDR0, next
+             * = IDR1, etc — matching how PCIDevice.OutLong writes bytes to
+             * the device. So mac[0] = lo & 0xFF, mac[1] = (lo>>8), etc. */
+            ULONG lo = base->pciDevice->InLong(base->bar_io + 0);
+            ULONG hi = base->pciDevice->InLong(base->bar_io + 4);
+            base->mac[0] = (UBYTE)(lo & 0xFF);
+            base->mac[1] = (UBYTE)((lo >>  8) & 0xFF);
+            base->mac[2] = (UBYTE)((lo >> 16) & 0xFF);
+            base->mac[3] = (UBYTE)((lo >> 24) & 0xFF);
+            base->mac[4] = (UBYTE)(hi & 0xFF);
+            base->mac[5] = (UBYTE)((hi >>  8) & 0xFF);
+            iexec->DebugPrintF("[rtl8139re] MAC = %02x:%02x:%02x:%02x:%02x:%02x\n",
                                base->mac[0], base->mac[1], base->mac[2],
                                base->mac[3], base->mac[4], base->mac[5]);
 
@@ -460,10 +461,32 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
             ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
         } else {
+            /* Real S2_GETSTATIONADDRESS. Read MAC via InLong then
+             * pack into SrcAddr[0..5] + DstAddr[0..5]. */
+            volatile ULONG lo_v = base->pciDevice->InLong(base->bar_io + RTL_IDR0);
+            volatile ULONG hi_v = base->pciDevice->InLong(base->bar_io + RTL_IDR4);
+            ULONG lo = lo_v, hi = hi_v;
+            base->mac[0] = (UBYTE)(lo & 0xFF);
+            base->mac[1] = (UBYTE)((lo >>  8) & 0xFF);
+            base->mac[2] = (UBYTE)((lo >> 16) & 0xFF);
+            base->mac[3] = (UBYTE)((lo >> 24) & 0xFF);
+            base->mac[4] = (UBYTE)(hi & 0xFF);
+            base->mac[5] = (UBYTE)((hi >>  8) & 0xFF);
             for (int i = 0; i < 6; i++) {
                 ioreq->ios2_SrcAddr[i] = base->mac[i];
                 ioreq->ios2_DstAddr[i] = base->mac[i];
             }
+            /* Bonus: pack MAC bytes into ios2_DataLength + PacketType
+             * as a workaround — SrcAddr/DstAddr writes appear to be
+             * lost between driver and caller on this OS4 setup for
+             * reasons we haven't isolated. ULONG field writes DO
+             * persist reliably. */
+            ioreq->ios2_DataLength = ((ULONG)base->mac[0] << 24) |
+                                     ((ULONG)base->mac[1] << 16) |
+                                     ((ULONG)base->mac[2] <<  8) |
+                                     ((ULONG)base->mac[3]);
+            ioreq->ios2_PacketType = ((ULONG)base->mac[4] << 24) |
+                                     ((ULONG)base->mac[5] << 16);
         }
         break;
     }

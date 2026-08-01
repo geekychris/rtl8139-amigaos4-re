@@ -83,18 +83,27 @@ int main(int argc, char **argv)
                  (long)rc, (long)req->ios2_Req.io_Error);
 
     /* S2_GETSTATIONADDRESS: retrieve the MAC our driver read from
-     * IDR0/IDR4. Fills ios2_SrcAddr[0..5] (HW MAC) and _DstAddr. */
+     * IDR0/IDR4. Fills ios2_SrcAddr[0..5] (HW MAC) and _DstAddr.
+     * Pre-set SrcAddr[0..5] to a MARKER (0xAA) so if driver doesn't
+     * write, we see 0xAA (not 0). Distinguishes "not written" from
+     * "written but cleared". */
     for (int i = 0; i < 6; i++) {
-        req->ios2_SrcAddr[i] = 0;
-        req->ios2_DstAddr[i] = 0;
+        req->ios2_SrcAddr[i] = 0xAA;
+        req->ios2_DstAddr[i] = 0xBB;
     }
     req->ios2_Req.io_Command = S2_GETSTATIONADDRESS;
     req->ios2_Req.io_Error   = 0;
     LONG rc2 = IExec->DoIO((struct IORequest *)req);
-    IDOS->Printf("S2_GETSTATIONADDRESS: DoIO=%ld io_Error=%ld MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                 (long)rc2, (long)req->ios2_Req.io_Error,
-                 req->ios2_SrcAddr[0], req->ios2_SrcAddr[1], req->ios2_SrcAddr[2],
-                 req->ios2_SrcAddr[3], req->ios2_SrcAddr[4], req->ios2_SrcAddr[5]);
+    IDOS->Printf("S2_GETSTATIONADDRESS: DoIO=%ld io_Error=%ld\n",
+                 (long)rc2, (long)req->ios2_Req.io_Error);
+    /* Report MAC via the ULONG workaround (SrcAddr/DstAddr writes get
+     * lost on this OS4 setup — see driver notes). */
+    ULONG w0 = req->ios2_DataLength;
+    ULONG w1 = req->ios2_PacketType;
+    IDOS->Printf("  MAC (via ULONG workaround) = %02lx:%02lx:%02lx:%02lx:%02lx:%02lx\n",
+                 (w0 >> 24) & 0xFF, (w0 >> 16) & 0xFF,
+                 (w0 >>  8) & 0xFF, (w0      ) & 0xFF,
+                 (w1 >> 24) & 0xFF, (w1 >> 16) & 0xFF);
 
     IExec->CloseDevice((struct IORequest *)req);
     IExec->FreeSysObject(ASOT_IOREQUEST, req);
