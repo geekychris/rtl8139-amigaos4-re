@@ -41,7 +41,7 @@ DEV_DBG  = $(BUILD)/rtl8139re.device.debug
 
 # Add every test binary here as it lands. Each corresponds to
 # tests/<name>.c, compiled the same way.
-TEST_NAMES = testopen offs testtx
+TEST_NAMES = testopen offs testtx testrx_diag
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
 DEV_SRC  = src/device.c

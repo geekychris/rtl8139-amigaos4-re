@@ -163,6 +163,12 @@ static void v_cleanup(struct Rtl8139ReBase *base)
         base->tx_buffer = NULL;
         base->tx_buffer_phys = 0;
     }
+    if (base->rx_ring_raw) {
+        IExec->FreeMem(base->rx_ring_raw, base->rx_ring_raw_size);
+        base->rx_ring_raw = NULL;
+        base->rx_ring = NULL;
+        base->rx_ring_phys = 0;
+    }
     if (base->bar_range && base->pciDevice) {
         base->pciDevice->FreeResourceRange(base->bar_range);
         base->bar_range = NULL;
@@ -365,13 +371,47 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
                                    RTL_TX_SLOTS, RTL_TX_BUF_SIZE);
             }
 
-            /* Enable TE (Transmit Enable) in ChipCmd. Also program TCR
-             * to sensible defaults (16 retries, standard IFG). On QEMU
-             * the RTL8139 is happy with defaults; datasheet bit spec
-             * matters more on real hardware. */
+            /* Allocate RX ring — 8 KB + 16-byte wrap padding + a bit
+             * of slack for chip prefetch. Same MEMF_KICK|CLEAR pattern
+             * as TX; align to 32 bytes for cache-line safety. */
+            ULONG rx_total = RTL_RX_RING_SIZE + RTL_RX_RING_PAD + 64;
+            base->rx_ring_raw = iexec->AllocMem(rx_total, MEMF_KICK | MEMF_CLEAR);
+            base->rx_ring_raw_size = rx_total;
+            base->rx_ring = base->rx_ring_raw
+                ? (APTR)(((ULONG)base->rx_ring_raw + 31UL) & ~31UL) : NULL;
+            if (base->rx_ring) {
+                /* MEMF_KICK memory is identity-mapped for DMA on this
+                 * platform; CPU virt = PCI-bus phys. Don't call
+                 * StartDMA — it doesn't nest and we don't need it. */
+                base->rx_ring_phys = (ULONG)base->rx_ring;
+                iexec->DebugPrintF("[rtl8139re] rx_ring: cpu=%p phys=%08lx size=%lu\n",
+                                   base->rx_ring,
+                                   (unsigned long)base->rx_ring_phys,
+                                   (unsigned long)RTL_RX_RING_SIZE);
+
+                /* Program RBSTART with the ring's DMA physical addr. */
+                base->pciDevice->OutLong(base->bar_io + RTL_RBSTART,
+                                         base->rx_ring_phys);
+                /* Program RCR: accept-physical + accept-broadcast +
+                 * WRAP + unlimited MXDMA. RBLEN=00 selects 8KB+16. */
+                base->pciDevice->OutLong(base->bar_io + RTL_RCR,
+                                         RTL_RCR_DEFAULT);
+                /* Zero CAPR (driver read pointer) — chip resets to
+                 * 0xFFF0 (= "one 16-byte block before start"), which
+                 * is the correct initial value; leave alone. */
+            } else {
+                iexec->DebugPrintF("[rtl8139re] rx_ring alloc FAILED\n");
+            }
+
+            /* Enable TE + RE in ChipCmd. Also program TCR to sensible
+             * defaults (16 retries, standard IFG). Do this LAST so
+             * ring registers are programmed before the NIC starts
+             * looking at them. */
             base->pciDevice->OutLong(base->bar_io + RTL_TCR, 0x03000700);
-            base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
-            iexec->DebugPrintF("[rtl8139re] TX enabled (TCR=03000700, CR=TE)\n");
+            base->pciDevice->OutByte(base->bar_io + RTL_CR,
+                                     RTL_CR_TE | RTL_CR_RE);
+            iexec->DebugPrintF("[rtl8139re] TX+RX enabled (TCR=03000700, CR=TE|RE, RCR=%08lx)\n",
+                               (unsigned long)RTL_RCR_DEFAULT);
         } else {
             iexec->DebugPrintF("[rtl8139re] GetResourceRange(0) FAILED\n");
         }
@@ -577,6 +617,21 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         if (!done) {
             ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
         }
+        break;
+    }
+    case 0xE001: {  /* Private DBG_RXSTATE — pack rx-ring diagnostics */
+        if (!base->hw_present) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            break;
+        }
+        struct PCIDevice *pd = base->pciDevice;
+        ULONG bar = base->bar_io;
+        volatile ULONG cbr  = pd->InLong(bar + RTL_CBR);   /* also reads CAPR high half */
+        volatile ULONG isr  = pd->InLong(bar + RTL_ISR);
+        volatile ULONG cr   = pd->InLong(bar + RTL_CR);
+        ioreq->ios2_DataLength = cbr;
+        ioreq->ios2_WireError  = isr & 0xFFFF;
+        ioreq->ios2_PacketType = cr & 0xFF;
         break;
     }
     default:

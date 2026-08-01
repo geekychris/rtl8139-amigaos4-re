@@ -74,7 +74,34 @@ struct Rtl8139ReBase
     ULONG              tx_buffer_phys;
     UBYTE              tx_next_slot;
     UBYTE              _pad_tx[3];
+
+    /* RX ring: single 8KB circular buffer + 16-byte no-wrap padding
+     * + a few extra bytes for chip prefetch. NIC writes incoming
+     * packets into it starting at CBA offset, driver reads and
+     * advances CAPR. Each packet is prefixed by a 4-byte header
+     * (u16 status | u16 length). */
+    APTR               rx_ring_raw;
+    ULONG              rx_ring_raw_size;
+    APTR               rx_ring;
+    ULONG              rx_ring_phys;
 };
+
+#define RTL_RX_RING_SIZE  (8 * 1024)      /* RBLEN=00 → 8 KB */
+#define RTL_RX_RING_PAD   16              /* WRAP=1 padding */
+
+/* RTL8139 RCR (Receive Configuration) bits */
+#define RTL_RCR_AAP   0x0001   /* accept all physical (promiscuous) */
+#define RTL_RCR_APM   0x0002   /* accept physical match */
+#define RTL_RCR_AM    0x0004   /* accept multicast */
+#define RTL_RCR_AB    0x0008   /* accept broadcast */
+#define RTL_RCR_WRAP  0x0080   /* 1 = pad overflow to +16, no wrap in ring */
+#define RTL_RCR_MXDMA_UNLIMITED 0x0700   /* MXDMA=111 */
+#define RTL_RCR_RXFTH_NONE     0xE000   /* wait — layout differs across revisions,
+                                         * safe conservative: no threshold */
+
+/* Sensible default RCR: broadcast + physical match + wrap-pad-16 +
+ * unlimited DMA burst. Add AAP for promiscuous / debugging. */
+#define RTL_RCR_DEFAULT   (RTL_RCR_APM | RTL_RCR_AB | RTL_RCR_WRAP | RTL_RCR_MXDMA_UNLIMITED)
 
 /* RTL8139 register offsets from BAR I/O base. */
 #define RTL_IDR0   0x00
