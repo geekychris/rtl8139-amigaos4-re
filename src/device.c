@@ -78,6 +78,93 @@ static uint32 rtl_isr(struct ExecBase *sysbase, struct Rtl8139ReBase *base)
     return 1;   /* claimed */
 }
 
+/* Walk the RX ring and dispatch received packets to matching openers.
+ * Called from BeginIO after any client-initiated command (client-
+ * driven drain — no unit task yet). Non-reentrant; assumes caller is
+ * in task context, NOT interrupt context.
+ *
+ * Ring layout (RTL8139 datasheet ch 6):
+ *   - 8 KB circular buffer + 16-byte pad (RCR_WRAP=1 -> chip pads
+ *     overflow into +16 area so a packet at ring end is contiguous).
+ *   - Each packet is prefixed by a 4-byte header:
+ *       byte 0-1: status word (bit 0 = ROK)
+ *       byte 2-3: length including 4-byte FCS
+ *   - CBR (0x3A) = chip's write pointer (offset into ring)
+ *   - CAPR (0x38) = driver's read pointer, biased by -16. So driver
+ *     reads from (CAPR + 16) & (RING_SIZE-1).
+ */
+static void rtl_rx_drain(struct Rtl8139ReBase *base)
+{
+    if (!base->is_online || !base->rx_ring || !base->pciDevice) return;
+    struct PCIDevice *pd = base->pciDevice;
+    ULONG bar = base->bar_io;
+    UBYTE *ring = (UBYTE *)base->rx_ring;
+
+    UWORD cbr = pd->InWord(bar + RTL_CBR);
+    UWORD capr = pd->InWord(bar + RTL_CAPR);
+    UWORD read_off = (UWORD)((capr + 16) & (RTL_RX_RING_SIZE - 1));
+
+    /* Cap iterations to avoid infinite loop on malformed ring. */
+    for (int i = 0; i < 32 && read_off != cbr; i++) {
+        UBYTE *pkt = ring + read_off;
+        UWORD status = (UWORD)pkt[0] | ((UWORD)pkt[1] << 8);
+        UWORD length = (UWORD)pkt[2] | ((UWORD)pkt[3] << 8);
+
+        if (!(status & 0x0001) || length < 18 || length > 1600) {
+            /* Bad packet — drop everything, hope next drain resyncs. */
+            base->stats.BadData++;
+            break;
+        }
+        UBYTE *body = pkt + 4;
+        UWORD body_len = (UWORD)(length - 4);  /* strip FCS */
+        UWORD ethertype = ((UWORD)body[12] << 8) | body[13];
+
+        /* Match against first opener whose packet_type matches. */
+        base->IExec->ObtainSemaphore(base->io_lock);
+        struct Rtl8139Opener *op = (struct Rtl8139Opener *)base->openers.mlh_Head;
+        int delivered = 0;
+        while (op && op->node.mln_Succ) {
+            struct Rtl8139Opener *next =
+                (struct Rtl8139Opener *)op->node.mln_Succ;
+            if (op->packet_type == ethertype) {
+                struct Node *rn = base->IExec->RemHead(&op->pending_reads);
+                if (rn) {
+                    struct IOSana2Req *r = (struct IOSana2Req *)rn;
+                    UBYTE *dst = (UBYTE *)r->ios2_Data;
+                    UWORD copy = body_len;
+                    if (r->ios2_DataLength > 0 && copy > r->ios2_DataLength)
+                        copy = (UWORD)r->ios2_DataLength;
+                    for (UWORD b = 0; b < copy; b++) dst[b] = body[b];
+                    r->ios2_DataLength = copy;
+                    for (int a = 0; a < 6; a++) {
+                        r->ios2_DstAddr[a] = body[a];
+                        r->ios2_SrcAddr[a] = body[6 + a];
+                    }
+                    r->ios2_PacketType   = ethertype;
+                    r->ios2_Req.io_Error = 0;
+                    base->IExec->ReplyMsg((struct Message *)r);
+                    op->stat_rx_pkts++;
+                    op->stat_rx_bytes += body_len;
+                    base->stats.PacketsReceived++;
+                    delivered = 1;
+                    break;
+                }
+            }
+            op = next;
+        }
+        base->IExec->ReleaseSemaphore(base->io_lock);
+        if (!delivered) base->stats.UnknownTypesReceived++;
+
+        /* Advance: pkt + length + 4 header, 4-byte aligned. */
+        read_off = (UWORD)((read_off + length + 4 + 3) & ~3);
+        read_off = (UWORD)(read_off & (RTL_RX_RING_SIZE - 1));
+    }
+
+    /* Update CAPR = new read position - 16 (biasing). */
+    UWORD new_capr = (UWORD)((read_off - 16) & (RTL_RX_RING_SIZE - 1));
+    pd->OutWord(bar + RTL_CAPR, new_capr);
+}
+
 /* Interface refcount helpers — standard OS4 idiom. */
 uint32 _manager_Obtain(struct DeviceManagerInterface *Self)
 {
@@ -648,8 +735,11 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
     ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
 
-    /* Currently implements S2_GETSTATIONADDRESS + CMD_WRITE. All
-     * other commands reply IOERR_NOCMD. */
+    /* Client-driven RX drain — process any pending frames before we
+     * handle this command. Later this should move to a unit task
+     * signalled from the ISR. */
+    rtl_rx_drain(base);
+
     switch (ioreq->ios2_Req.io_Command) {
     case S2_GETSTATIONADDRESS: {
         if (!base->hw_present) {
