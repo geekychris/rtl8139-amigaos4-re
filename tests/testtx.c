@@ -4,8 +4,8 @@
  * On success: /tmp/qemu-n3.pcap should contain a real broadcast ARP
  * packet, not zeros. That validates the whole TX path we just built.
  *
- * No S2_CONFIGINTERFACE / S2_ONLINE — Phase D driver enables TE at
- * Init time. Just OpenDevice, CMD_WRITE, CloseDevice.
+ * No S2_CONFIGINTERFACE / S2_ONLINE — the driver enables TE at Init
+ * time so CMD_WRITE works immediately after OpenDevice.
  */
 
 #include <exec/errors.h>

@@ -1,7 +1,7 @@
 /*
  * testopen — probes rtl8139re.device.
  *   1. OpenDevice on unit 0 (expected: rc=0 IF Init found a PCI device)
- *   2. NSCMD_DEVICEQUERY (expected in Phase A/B: IOERR_NOCMD = -3)
+ *   2. NSCMD_DEVICEQUERY (expected: IOERR_NOCMD = -3 for now)
  *   3. Read PCI ident from device's config space via the PCI iface,
  *      so we can cross-check what the driver bound.
  */

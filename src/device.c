@@ -1,15 +1,13 @@
 /*
- * rtl8139re.device — C reconstruction of Hyperion's rtl8139.device 53.4.
+ * rtl8139re.device — AmigaOS 4 SANA-II network driver for the
+ * Realtek RTL8139 family.
  *
- * PHASE A — library init + cleanup + expunge.
+ * Currently implements: library/PCI init, MAC read via IDR0..IDR5,
+ * CMD_WRITE (TX via TSAD/TSD register pair, 4-slot round-robin,
+ * synchronous poll). Pending: IRQ handling, RX ring, S2_ONLINE /
+ * S2_CONFIGINTERFACE, opener list, full command dispatcher.
  *
- * Translates DevInit (rtl.asm 0x100023c, 684 bytes) and DevCleanup
- * (0x100016c, 208 bytes). DevExpunge (0x10004e8, 196 bytes) and
- * DevAbortIO (0x100007c, 240 bytes) also included since they're small
- * and referenced from the AutoInit function table.
- *
- * See docs/FUNCTION_MAP.md for the full map. Struct layout in
- * include/rtl8139re.h.
+ * Single-unit, PCI I/O BAR only (no MMIO), tested on QEMU sam460ex.
  */
 
 #include "rtl8139re.h"
@@ -36,9 +34,9 @@
 #define DEVVERSIONSTRING  VSTRING
 
 /*
- * The RTL8139 vendor:device ID table from the original binary's rodata
- * at 0x100a370. 16 real entries + a 0xFFFFFFFF terminator. Order matters
- * only for the search itself; leaving it identical for byte-compat.
+ * Vendor:Device pairs matched by the driver. First entry is the
+ * canonical Realtek RTL8139; the rest are known RTL8139-compatible
+ * variants and rebadged parts. Terminated by 0xFFFF:0xFFFF.
  */
 const struct Rtl8139DeviceID rtl8139_device_ids[] = {
     {0x10EC, 0x8139}, {0x10EC, 0x8138}, {0x1113, 0x1211}, {0x1500, 0x1360},
@@ -144,10 +142,8 @@ int _start(char *argstring, int arglen, struct ExecBase *sysbase)
 
 /* ------------------------------------------------------------------- */
 /* Cleanup — reverse of what DevInit + DevOpen have set up so far.     */
-/*                                                                      */
-/* Original: 0x100016c, 208 bytes. Drops 4 interfaces + closes 4 libs. */
-/* We use per-field NULL checks so callers can invoke it at any point  */
-/* during Init to roll back a partial success.                         */
+/* Per-field NULL checks so callers can invoke it at any point during  */
+/* Init to roll back a partial success.                                */
 /* ------------------------------------------------------------------- */
 
 static void v_cleanup(struct Rtl8139ReBase *base)
@@ -159,9 +155,8 @@ static void v_cleanup(struct Rtl8139ReBase *base)
     if (base->IExpansion)   { IExec->DropInterface((struct Interface *)base->IExpansion); base->IExpansion = NULL; }
     if (base->IDOS)         { IExec->DropInterface((struct Interface *)base->IDOS); base->IDOS = NULL; }
 
-    /* Free PCI device first (needs IPCI which we drop above; move
-     * up if that ordering matters — original drops device before
-     * dropping IPCI, so free here BEFORE those go away. Reordering: */
+    /* Free PCI device + BAR + TX buffer BEFORE dropping IPCI, since
+     * FreeDevice/FreeResourceRange need the IPCI interface alive. */
     if (base->tx_buffer_raw) {
         IExec->FreeMem(base->tx_buffer_raw, base->tx_buffer_raw_size);
         base->tx_buffer_raw = NULL;
@@ -186,14 +181,12 @@ static void v_cleanup(struct Rtl8139ReBase *base)
 }
 
 /* ------------------------------------------------------------------- */
-/* Init — the AutoInit hook, called by exec when the resident tag is  */
+/* Init — the AutoInit hook, called by exec when the resident tag is   */
 /* first processed. Sets library metadata, opens dos/expansion/utility */
-/* + their "main" interfaces, gets IPCI, probes newmemory.resource.    */
-/* On any library failure: DevCleanup and return the library base      */
-/* anyway (letting exec put us in the library list — Expunge will      */
-/* handle removal). The original returns 0 on total failure; a         */
-/* partial-success base is fine, since Open will re-check.             */
-/* Original: 0x100023c, 684 bytes.                                     */
+/* + their "main" interfaces, gets IPCI, probes newmemory.resource,    */
+/* enumerates the RTL8139 PCI device, grabs BAR0, enables IO+BM, and   */
+/* allocates the TX buffer pool. On failure DevCleanup + return the    */
+/* base anyway; Open will refuse.                                      */
 /* ------------------------------------------------------------------- */
 
 struct Library *_manager_Init(struct Library *library, BPTR seglist,
@@ -205,11 +198,9 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
     base->IExec       = iexec;
     base->dev_SegList = (ULONG)seglist;
 
-    /* Library metadata — original sets ln_Type=NT_DEVICE, ln_Pri=0,
-     * lib_Flags=6 (SUMUSED | CHANGED), lib_Version=53, lib_Revision=4,
-     * lib_Node.ln_Name = "rtl8139.device", lib_IdString = VSTRING.
-     * The kernel does most of this from the resident tag, but the
-     * original hand-fills to be sure. */
+    /* Library metadata — the kernel populates most of this from the
+     * resident tag, but hand-filling here keeps things explicit
+     * regardless of exec version. */
     base->dev_Base.dd_Library.lib_Node.ln_Type = NT_DEVICE;
     base->dev_Base.dd_Library.lib_Node.ln_Name = (STRPTR)DEVNAME;
     base->dev_Base.dd_Library.lib_Node.ln_Pri  = 0;
@@ -220,8 +211,7 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
     iexec->DebugPrintF("[rtl8139re] Init: DevBase=%p sizeof=%lu\n",
                        base, (unsigned long)sizeof(*base));
 
-    /* IO lock — AllocSysObject(ASOT_SEMAPHORE). Guards openers list
-     * and unit table (Phase B). Original stores at r31+40. */
+    /* IO lock — will guard openers list + unit table once those land. */
     base->io_lock = iexec->AllocSysObject(ASOT_SEMAPHORE, NULL);
 
     /* Open the three libraries. If any fails, cleanup + still return
@@ -236,8 +226,7 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
     base->UtilityBase = iexec->OpenLibrary("utility.library", 51);
     if (!base->UtilityBase) goto fail;
 
-    /* Get "main" interfaces (v1). The original names these all the
-     * same string constant ("main") from rodata 0x100a144. */
+    /* Get the "main" interface (v1) on each library. */
     base->IDOS = (struct DOSIFace *)iexec->GetInterface(
         base->DOSBase, "main", 1, NULL);
     if (!base->IDOS) goto fail;
@@ -250,22 +239,21 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
         base->UtilityBase, "main", 1, NULL);
     if (!base->IUtility) goto fail;
 
-    /* Get IPCI — the "pci" interface on expansion.library. Original
-     * uses this for FindDeviceTags in DevOpen. */
+    /* Get IPCI — the "pci" interface on expansion.library. Used for
+     * FindDeviceTags below. */
     base->IPCI = (struct PCIIFace *)iexec->GetInterface(
         base->ExpansionBase, "pci", 1, NULL);
     if (!base->IPCI) goto fail;
 
-    /* Probe newmemory.resource. Original stores a boolean at
-     * r31+168 — TRUE if the resource is available. We mirror that
-     * flag but nothing else in the current phase uses it. */
+    /* Probe newmemory.resource — kept as a boolean flag for future
+     * use; nothing consumes it in the current build. */
     APTR nmem = iexec->OpenResource("newmemory.resource");
     base->has_newmemory = (nmem != NULL) ? 1 : 0;
 
-    /* Phase B: walk the vendor:device table and grab a matching PCI
-     * device. Prefer Index=1+ so we DON'T take the first rtl8139
-     * (owned by Hyperion's shipping driver + amiga-bridge on our
-     * test setup). Fall back to Index=0 if no second chip exists. */
+    /* Walk the vendor:device table and grab a matching PCI device.
+     * Prefer Index=1+ so we don't collide with any other rtl8139
+     * driver that may have taken Index=0. Fall back to Index=0 if
+     * no second chip exists. */
     for (int idx = 1; idx >= 0 && !base->pciDevice; idx--) {
         for (const struct Rtl8139DeviceID *id = rtl8139_device_ids;
              id->vendor != 0xFFFF; id++) {
@@ -291,26 +279,18 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
                            "OpenDevice on unit 0 will fail\n");
     }
 
-    /* Phase C: bring the chip's registers within reach + read the MAC.
-     *
-     * The original does this per-unit inside DevOpen (PopulateUnitPCI
-     * + ChipStart). Since we're single-unit, do it once here at Init;
-     * cleaner and simpler.
+    /* Bring the chip's registers within reach + read the MAC.
      *
      * Steps:
      *   1. GetResourceRange(0) → BAR0 (I/O port range for RTL8139)
      *   2. Set PCI command bits (BUSMASTER | IO_ENABLE) via
      *      WriteConfigLong(PCI_COMMAND, ...)
-     *   3. Read MAC via InLong(BAR+IDR0) + InLong(BAR+IDR4). QEMU
-     *      pre-seeds IDR0-5 from the -device mac= param (or default
-     *      52:54:00:12:34:57 on n0).
+     *   3. Read MAC via InLong(BAR+IDR0) + InLong(BAR+IDR4).
      *
      * PCIDevice.InLong / OutLong auto-byteswap on PPC — the OS4 PCI
-     * stack knows the bus is LE. So the ULONG we get back is
-     * "already in host order" for the fields the RTL treats as
-     * bytes — but the MAC comes back as a little-endian ULONG that
-     * we need to break into bytes in that same LE order. That
-     * matches WriteMacToChip's byteswap-on-write pattern in reverse.
+     * stack knows the bus is LE. So the ULONG we get back is in host
+     * order for byte-lane purposes; the low byte of InLong(BAR+0)
+     * is IDR0, next byte IDR1, etc.
      */
     if (base->pciDevice) {
         base->bar_range = base->pciDevice->GetResourceRange(0);
@@ -353,12 +333,11 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
 
             base->hw_present = TRUE;
 
-            /* Phase D: allocate TX buffer pool (4 slots x 2 KB) with
-             * MEMF_KICK|MEMF_CLEAR. Same allocation pattern that
-             * unblocked ring alloc for virte1000/virtio_net —
-             * AllocVecTags with alignment attrs silently fails at
-             * KB sizes, plain AllocMem works. 8 KB fits comfortably
-             * in the MEMF_KICK region. */
+            /* Allocate TX buffer pool (4 slots x 2 KB) via plain
+             * AllocMem with MEMF_KICK|MEMF_CLEAR. AllocVecTags with
+             * alignment attrs silently fails at KB sizes on some
+             * OS4/sam460ex builds — AllocMem is the reliable path.
+             * Over-allocate for 32-byte manual alignment. */
             ULONG total = RTL_TX_BUF_SIZE * RTL_TX_SLOTS + 32;  /* over-align */
             base->tx_buffer_raw = iexec->AllocMem(total, MEMF_KICK | MEMF_CLEAR);
             base->tx_buffer_raw_size = total;
@@ -386,10 +365,10 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
                                    RTL_TX_SLOTS, RTL_TX_BUF_SIZE);
             }
 
-            /* Phase D: enable TE (Transmit Enable) in ChipCmd. Also
-             * program TCR to default (16 retries, 0x00000600 IFG).
-             * On QEMU the RTL8139 is happy with defaults; the datasheet
-             * bit spec matters more on real hardware. */
+            /* Enable TE (Transmit Enable) in ChipCmd. Also program TCR
+             * to sensible defaults (16 retries, standard IFG). On QEMU
+             * the RTL8139 is happy with defaults; datasheet bit spec
+             * matters more on real hardware. */
             base->pciDevice->OutLong(base->bar_io + RTL_TCR, 0x03000700);
             base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
             iexec->DebugPrintF("[rtl8139re] TX enabled (TCR=03000700, CR=TE)\n");
@@ -408,13 +387,14 @@ fail:
     iexec->DebugPrintF("[rtl8139re] Init: library/interface open failed — "
                        "cleaning up but keeping base\n");
     v_cleanup(base);
-    /* Return the base anyway; Open will refuse. The original does the
-     * same — DevCleanup then tail returns the library. */
+    /* Return the base anyway; Open will refuse. Letting exec add the
+     * device to the library list means Expunge handles removal
+     * cleanly. */
     return (struct Library *)base;
 }
 
 /* ------------------------------------------------------------------- */
-/* Open / Close / Expunge — Phase A stubs; Phase B adds unit setup.   */
+/* Open / Close / Expunge.                                             */
 /* ------------------------------------------------------------------- */
 
 struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
@@ -424,21 +404,20 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
     (void)flags;
     struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
 
-    /* Refuse if Init didn't complete (any of the required libs/ifaces
-     * missing). Original checks by looking at a "ok" flag; we
-     * inspect the fields directly. */
+    /* Refuse if Init didn't complete (any required libs/ifaces missing). */
     if (!base->IDOS || !base->IExpansion || !base->IUtility || !base->IPCI) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
         return NULL;
     }
 
-    /* Original rejects unit > 7. Bridge tests use unit 0. */
+    /* Reject unit > 7 (arbitrary max — real hardware never has that
+     * many RTL8139s in one system). */
     if (unitNum > 7) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
         return NULL;
     }
 
-    /* Phase B: refuse if no PCI device was found at Init. */
+    /* Refuse if no PCI device was bound at Init. */
     if (!base->pciDevice) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
         return NULL;
@@ -447,9 +426,7 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
     base->dev_Base.dd_Library.lib_OpenCnt++;
     base->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
     ioreq->ios2_Req.io_Error = 0;
-    ioreq->ios2_Req.io_Unit  = (struct Unit *)base;   /* Phase B will
-                                                       * return a per-unit
-                                                       * struct instead. */
+    ioreq->ios2_Req.io_Unit  = (struct Unit *)base;   /* single unit for now */
     return base;
 }
 
@@ -483,11 +460,9 @@ BPTR _manager_Expunge(struct DeviceManagerInterface *Self)
 }
 
 /* ------------------------------------------------------------------- */
-/* BeginIO / AbortIO — Phase A stubs.                                  */
-/*                                                                      */
-/* AbortIO original: 0x100007c, 240 bytes — canonical Amiga AbortIO.   */
-/* Under IExec.Disable, removes the IOReq from any queue, replies it,  */
-/* re-enables. Phase B (unit task) implements the queue.                */
+/* BeginIO — SANA-II dispatch.                                         */
+/* AbortIO — canonical Amiga AbortIO: under IExec.Disable, removes     */
+/* the IOReq from any queue, replies it, re-enables.                   */
 /* ------------------------------------------------------------------- */
 
 void _manager_BeginIO(struct DeviceManagerInterface *Self,
@@ -499,9 +474,8 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
     ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
 
-    /* Phase C: implement S2_GETSTATIONADDRESS so tests can retrieve
-     * the MAC read at Init. Fills ios2_SrcAddr (HW MAC) and
-     * ios2_DstAddr (current MAC — same as HW since we don't rewrite). */
+    /* Currently implements S2_GETSTATIONADDRESS + CMD_WRITE. All
+     * other commands reply IOERR_NOCMD. */
     switch (ioreq->ios2_Req.io_Command) {
     case S2_GETSTATIONADDRESS: {
         if (!base->hw_present) {
@@ -539,19 +513,18 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
     }
     case CMD_WRITE:
     case S2_BROADCAST: {
-        /* Phase D: TX handler. Direct write to RTL8139 TSAD/TSD
-         * registers — no unit task, no ring, no async. Synchronous
-         * in BeginIO context.
+        /* TX handler. Direct write to RTL8139 TSAD/TSD register pair.
+         * Synchronous in BeginIO context (no unit task, no ring, no
+         * async).
          *
-         * Sequence:
          *   1. Pick TX slot (round-robin 0..3)
-         *   2. Copy packet from ios2_Data (RAW mode) to tx_buffer[slot]
-         *   3. CacheClearE to ensure CPU write reaches RAM
+         *   2. Copy caller's frame to tx_buffer[slot]; pad to 60 bytes
+         *   3. CacheClearE to ensure CPU writes reach RAM
          *   4. OutLong(TSAD[slot], buf_phys)
-         *   5. OutLong(TSD[slot], length | flags)
-         *      TSD bits: [12:0]=size, [13]=OWN (0=HW), [15]=TUN, [16..]=DMA burst
-         *      Writing OWN=0 triggers TX.
-         *   6. Poll TSD.TOK (bit 15) — RTL8139 sets it when TX complete
+         *   5. OutLong(TSD[slot], length | early-TX-threshold)
+         *      Writing to TSD triggers TX; the NIC DMA-reads TSAD's
+         *      address, transmits, sets TOK bit when done.
+         *   6. Poll TSD.TOK (bit 15) or ABT/CRS (error) bits.
          */
         if (!base->hw_present || !base->tx_buffer) {
             ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
