@@ -107,6 +107,13 @@ struct Rtl8139ReBase
      * RX dispatch can walk openers and match on PacketType. Guarded
      * by io_lock semaphore for list mutation. */
     struct MinList     openers;
+
+    /* Init-time CR readback trace (diag). Populated once during Init
+     * so tests can see whether the chip actually latched TE|RE. */
+    UBYTE              cr_after_init;       /* CR before any writes */
+    UBYTE              cr_after_te;         /* after write of TE */
+    UBYTE              cr_after_te_re;      /* after write of TE|RE */
+    UBYTE              cr_after_re_rewrite; /* after 2nd write of TE|RE */
 };
 
 /* Per-opener state — created by _manager_Open, destroyed by _Close.

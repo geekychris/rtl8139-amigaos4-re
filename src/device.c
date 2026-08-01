@@ -447,13 +447,29 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
              * why enabling RE hangs the guest under testtx. */
             base->pciDevice->OutLong(base->bar_io + RTL_TCR, 0x03000700);
 #ifdef RTL_ENABLE_RX
-            base->pciDevice->OutByte(base->bar_io + RTL_CR,
-                                     RTL_CR_TE | RTL_CR_RE);
+            /* Diagnostic: read CR at each write step. On QEMU sam460ex
+             * the RE bit has been observed not to stick after a
+             * single CR=TE|RE write. Try TE first, then TE|RE. */
             {
-                ULONG cr_rb = base->pciDevice->InLong(base->bar_io + RTL_CR);
-                iexec->DebugPrintF("[rtl8139re] CR wrote %02x, readback %02x\n",
-                                   (unsigned)(RTL_CR_TE | RTL_CR_RE),
-                                   (unsigned)(cr_rb & 0xFF));
+                ULONG a = base->pciDevice->InLong(base->bar_io + RTL_CR);
+                base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
+                ULONG b = base->pciDevice->InLong(base->bar_io + RTL_CR);
+                base->pciDevice->OutByte(base->bar_io + RTL_CR,
+                                         RTL_CR_TE | RTL_CR_RE);
+                ULONG c = base->pciDevice->InLong(base->bar_io + RTL_CR);
+                /* Second write attempt in case RE needs a re-latch. */
+                base->pciDevice->OutByte(base->bar_io + RTL_CR,
+                                         RTL_CR_TE | RTL_CR_RE);
+                ULONG d = base->pciDevice->InLong(base->bar_io + RTL_CR);
+                base->cr_after_init       = (UBYTE)(a & 0xFF);
+                base->cr_after_te         = (UBYTE)(b & 0xFF);
+                base->cr_after_te_re      = (UBYTE)(c & 0xFF);
+                base->cr_after_re_rewrite = (UBYTE)(d & 0xFF);
+                iexec->DebugPrintF("[rtl8139re] CR steps: init=%02x afterTE=%02x afterTE|RE=%02x re-write=%02x\n",
+                                   (unsigned)(a & 0xFF),
+                                   (unsigned)(b & 0xFF),
+                                   (unsigned)(c & 0xFF),
+                                   (unsigned)(d & 0xFF));
             }
 #else
             base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
@@ -738,17 +754,21 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         }
         struct PCIDevice *pd = base->pciDevice;
         ULONG bar = base->bar_io;
-        volatile ULONG cbr  = pd->InLong(bar + RTL_CBR);   /* also reads IMR high half */
+        volatile ULONG cbr  = pd->InLong(bar + RTL_CBR);
         volatile ULONG isr  = pd->InLong(bar + RTL_ISR);
         volatile ULONG cr   = pd->InLong(bar + RTL_CR);
         ioreq->ios2_DataLength = cbr;
         ioreq->ios2_WireError  = isr & 0xFFFF;
         ioreq->ios2_PacketType = cr & 0xFF;
-        /* Add irq_count + last_isr as a bonus in ios2_Data field
-         * (repurposed since caller doesn't set it for this cmd). */
         ioreq->ios2_Data = (APTR)(ULONG)base->irq_count;
-        /* Overlay ios2_StatData with last_isr. */
         ioreq->ios2_StatData = (APTR)(ULONG)base->irq_last_isr;
+        break;
+    }
+    case 0xE002: {  /* Private DBG_CRTRACE — Init-time CR readback trace */
+        ioreq->ios2_DataLength = ((ULONG)base->cr_after_init << 24) |
+                                 ((ULONG)base->cr_after_te << 16) |
+                                 ((ULONG)base->cr_after_te_re << 8) |
+                                 ((ULONG)base->cr_after_re_rewrite);
         break;
     }
     case S2_ONLINE:
