@@ -162,6 +162,12 @@ static void v_cleanup(struct Rtl8139ReBase *base)
     /* Free PCI device first (needs IPCI which we drop above; move
      * up if that ordering matters — original drops device before
      * dropping IPCI, so free here BEFORE those go away. Reordering: */
+    if (base->tx_buffer_raw) {
+        IExec->FreeMem(base->tx_buffer_raw, base->tx_buffer_raw_size);
+        base->tx_buffer_raw = NULL;
+        base->tx_buffer = NULL;
+        base->tx_buffer_phys = 0;
+    }
     if (base->bar_range && base->pciDevice) {
         base->pciDevice->FreeResourceRange(base->bar_range);
         base->bar_range = NULL;
@@ -346,6 +352,47 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
                                base->mac[3], base->mac[4], base->mac[5]);
 
             base->hw_present = TRUE;
+
+            /* Phase D: allocate TX buffer pool (4 slots x 2 KB) with
+             * MEMF_KICK|MEMF_CLEAR. Same allocation pattern that
+             * unblocked ring alloc for virte1000/virtio_net —
+             * AllocVecTags with alignment attrs silently fails at
+             * KB sizes, plain AllocMem works. 8 KB fits comfortably
+             * in the MEMF_KICK region. */
+            ULONG total = RTL_TX_BUF_SIZE * RTL_TX_SLOTS + 32;  /* over-align */
+            base->tx_buffer_raw = iexec->AllocMem(total, MEMF_KICK | MEMF_CLEAR);
+            base->tx_buffer_raw_size = total;
+            base->tx_buffer = base->tx_buffer_raw
+                ? (APTR)(((ULONG)base->tx_buffer_raw + 31UL) & ~31UL) : NULL;
+            if (base->tx_buffer) {
+                /* Get DMA phys for the aligned base. */
+                ULONG nents = iexec->StartDMA(base->tx_buffer,
+                    RTL_TX_BUF_SIZE * RTL_TX_SLOTS, DMA_ReadFromRAM);
+                if (nents > 0) {
+                    struct DMAEntry *dl = (struct DMAEntry *)
+                        iexec->AllocSysObjectTags(ASOT_DMAENTRY,
+                            ASODMAE_NumEntries, nents, TAG_END);
+                    if (dl) {
+                        iexec->GetDMAList(base->tx_buffer,
+                            RTL_TX_BUF_SIZE * RTL_TX_SLOTS,
+                            DMA_ReadFromRAM, dl);
+                        base->tx_buffer_phys = (ULONG)dl[0].PhysicalAddress;
+                        iexec->FreeSysObject(ASOT_DMAENTRY, dl);
+                    }
+                }
+                iexec->DebugPrintF("[rtl8139re] tx_buffer: cpu=%p phys=%08lx (%d slots x %d bytes)\n",
+                                   base->tx_buffer,
+                                   (unsigned long)base->tx_buffer_phys,
+                                   RTL_TX_SLOTS, RTL_TX_BUF_SIZE);
+            }
+
+            /* Phase D: enable TE (Transmit Enable) in ChipCmd. Also
+             * program TCR to default (16 retries, 0x00000600 IFG).
+             * On QEMU the RTL8139 is happy with defaults; the datasheet
+             * bit spec matters more on real hardware. */
+            base->pciDevice->OutLong(base->bar_io + RTL_TCR, 0x03000700);
+            base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
+            iexec->DebugPrintF("[rtl8139re] TX enabled (TCR=03000700, CR=TE)\n");
         } else {
             iexec->DebugPrintF("[rtl8139re] GetResourceRange(0) FAILED\n");
         }
@@ -487,6 +534,75 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
                                      ((ULONG)base->mac[3]);
             ioreq->ios2_PacketType = ((ULONG)base->mac[4] << 24) |
                                      ((ULONG)base->mac[5] << 16);
+        }
+        break;
+    }
+    case CMD_WRITE:
+    case S2_BROADCAST: {
+        /* Phase D: TX handler. Direct write to RTL8139 TSAD/TSD
+         * registers — no unit task, no ring, no async. Synchronous
+         * in BeginIO context.
+         *
+         * Sequence:
+         *   1. Pick TX slot (round-robin 0..3)
+         *   2. Copy packet from ios2_Data (RAW mode) to tx_buffer[slot]
+         *   3. CacheClearE to ensure CPU write reaches RAM
+         *   4. OutLong(TSAD[slot], buf_phys)
+         *   5. OutLong(TSD[slot], length | flags)
+         *      TSD bits: [12:0]=size, [13]=OWN (0=HW), [15]=TUN, [16..]=DMA burst
+         *      Writing OWN=0 triggers TX.
+         *   6. Poll TSD.TOK (bit 15) — RTL8139 sets it when TX complete
+         */
+        if (!base->hw_present || !base->tx_buffer) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        ULONG len = ioreq->ios2_DataLength;
+        if (len == 0 || len > 1514 || !ioreq->ios2_Data) {
+            ioreq->ios2_Req.io_Error = S2ERR_MTU_EXCEEDED;
+            break;
+        }
+
+        UBYTE slot = base->tx_next_slot;
+        UBYTE *dst = (UBYTE *)base->tx_buffer + (slot * RTL_TX_BUF_SIZE);
+        ULONG dst_phys = base->tx_buffer_phys + (slot * RTL_TX_BUF_SIZE);
+
+        /* Copy caller's frame (RAW mode — full Ethernet). */
+        UBYTE *src = (UBYTE *)ioreq->ios2_Data;
+        for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+        /* Pad to Ethernet minimum 60 bytes. */
+        for (ULONG i = len; i < 60; i++) dst[i] = 0;
+        if (len < 60) len = 60;
+
+        /* Flush cache before doorbell. */
+        base->IExec->CacheClearE(dst, len, CACRF_ClearD);
+
+        struct PCIDevice *pd = base->pciDevice;
+        ULONG bar = base->bar_io;
+
+        /* Write DMA phys addr to TSADn. */
+        pd->OutLong(bar + RTL_TSAD0 + (slot * 4), dst_phys);
+
+        /* Write TSDn: length in low 13 bits, OWN=0 triggers TX.
+         * Also default early-TX-threshold (bits 16-21 = 32*256=8KB).
+         * QEMU accepts anything sensible; use 0x00030000 (256B threshold). */
+        ULONG tsd = (len & 0x1FFF) | (0x30 << 11);   /* threshold + len */
+        pd->OutLong(bar + RTL_TSD0 + (slot * 4), tsd);
+
+        /* Advance slot pointer round-robin. */
+        base->tx_next_slot = (slot + 1) & 0x3;
+
+        /* Poll TSD for TOK (bit 15) or ABT/CRS/TUN (error bits).
+         * QEMU should complete quickly. Cap at ~10ms. */
+        BOOL done = FALSE;
+        for (int i = 0; i < 5000; i++) {
+            ULONG s = pd->InLong(bar + RTL_TSD0 + (slot * 4));
+            if (s & (1UL << 15)) { done = TRUE; break; }  /* TOK */
+            if (s & (1UL << 30)) break;                    /* OWN — HW returned */
+        }
+        if (!done) {
+            ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
         }
         break;
     }

@@ -82,7 +82,22 @@ struct Rtl8139ReBase
     UBYTE              mac[6];
     UBYTE              _pad_mac[2];
     BOOL               hw_present;          /* TRUE iff BAR + MAC read OK */
+
+    /* Phase D: TX buffers — 4 slots (matches RTL8139 hardware). Each
+     * is a small MEMF_KICK|MEMF_CLEAR block that CPU writes to and the
+     * NIC DMA-reads. Buffers stored contiguously so we can allocate
+     * ONE block and slice. Original driver has ONE buffer per active
+     * TX request; we do simpler — 4 preallocated slots. */
+    APTR               tx_buffer_raw;      /* pre-alignment ptr for FreeMem */
+    ULONG              tx_buffer_raw_size;
+    APTR               tx_buffer;          /* aligned base of TX pool */
+    ULONG              tx_buffer_phys;     /* DMA phys of tx_buffer */
+    UBYTE              tx_next_slot;       /* round-robin 0..3 */
+    UBYTE              _pad_tx[3];
 };
+
+#define RTL_TX_BUF_SIZE   2048  /* per-slot; RTL8139 max frame is 1518 */
+#define RTL_TX_SLOTS      4
 
 /* RTL8139 register offsets (from BAR I/O base). Full spec in the
  * Realtek datasheet; we replicate what the original binary uses. */
