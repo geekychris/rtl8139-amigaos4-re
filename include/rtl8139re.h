@@ -84,6 +84,15 @@ struct Rtl8139ReBase
     ULONG              rx_ring_raw_size;
     APTR               rx_ring;
     ULONG              rx_ring_phys;
+
+    /* IRQ handler state. irq_installed guards Expunge so we RemIntServer
+     * only if AddIntServer succeeded. Counters are volatile since the
+     * ISR bumps them from interrupt context. */
+    struct Interrupt   irq_node;
+    ULONG              irq_vector;
+    BOOL               irq_installed;
+    volatile ULONG     irq_count;         /* total ISR fires */
+    volatile ULONG     irq_last_isr;      /* last ISR value seen */
 };
 
 #define RTL_RX_RING_SIZE  (8 * 1024)      /* RBLEN=00 → 8 KB */
@@ -102,6 +111,20 @@ struct Rtl8139ReBase
 /* Sensible default RCR: broadcast + physical match + wrap-pad-16 +
  * unlimited DMA burst. Add AAP for promiscuous / debugging. */
 #define RTL_RCR_DEFAULT   (RTL_RCR_APM | RTL_RCR_AB | RTL_RCR_WRAP | RTL_RCR_MXDMA_UNLIMITED)
+
+/* RTL8139 ISR / IMR bits (both registers share layout, at BAR+0x3C
+ * and BAR+0x3E respectively — u16). Writing 1 to an ISR bit clears
+ * it. Writing 1 to an IMR bit enables that interrupt cause. */
+#define RTL_ISR_ROK    0x0001   /* RX OK */
+#define RTL_ISR_RER    0x0002   /* RX Error */
+#define RTL_ISR_TOK    0x0004   /* TX OK */
+#define RTL_ISR_TER    0x0008   /* TX Error */
+#define RTL_ISR_RXOVW  0x0010   /* RX buffer overflow */
+#define RTL_ISR_PUN    0x0020   /* Packet Underrun / Link Change */
+#define RTL_ISR_FOVW   0x0040   /* RX FIFO overflow */
+#define RTL_ISR_SERR   0x8000   /* System Error */
+
+#define RTL_IMR_DEFAULT   (RTL_ISR_ROK | RTL_ISR_RER | RTL_ISR_TOK | RTL_ISR_TER | RTL_ISR_RXOVW | RTL_ISR_PUN | RTL_ISR_FOVW | RTL_ISR_SERR)
 
 /* RTL8139 register offsets from BAR I/O base. */
 #define RTL_IDR0   0x00

@@ -47,6 +47,36 @@ const struct Rtl8139DeviceID rtl8139_device_ids[] = {
     {0xFFFF, 0xFFFF},   /* terminator */
 };
 
+/* ISR — RTL8139 interrupt handler. Runs in interrupt context.
+ * Read ISR (BAR+0x3E), ACK by writing the same bits back, bump
+ * counters. Keep it minimal; deferred work happens in the unit
+ * task (Phase G). Returns 1 if the interrupt was "ours" (any bit
+ * set in ISR after we ACK) so the OS4 int dispatcher can move on. */
+static uint32 rtl_isr(struct ExecBase *sysbase, struct Rtl8139ReBase *base)
+{
+    (void)sysbase;
+    if (!base || !base->pciDevice || !base->bar_io) return 0;
+    ULONG bar = base->bar_io;
+    struct PCIDevice *pd = base->pciDevice;
+    /* ISR/IMR are 16-bit registers at BAR+0x3E / BAR+0x3C. Use
+     * InWord/OutWord — OutLong here would zero TCR (0x40-0x41).
+     *
+     * PCI IRQs on sam460ex are level-triggered and shared. To avoid
+     * re-entering while our ACK's write is still in flight to the
+     * chip, mask IMR first, then ACK ISR, then unmask. */
+    pd->OutWord(bar + RTL_IMR, 0);
+    UWORD isr = pd->InWord(bar + RTL_ISR);
+    if (!isr) {
+        pd->OutWord(bar + RTL_IMR, (UWORD)RTL_IMR_DEFAULT);
+        return 0;   /* not our interrupt */
+    }
+    base->irq_count++;
+    base->irq_last_isr = isr;
+    pd->OutWord(bar + RTL_ISR, isr);   /* W1C — clears the bits we saw */
+    pd->OutWord(bar + RTL_IMR, (UWORD)RTL_IMR_DEFAULT);
+    return 1;   /* claimed */
+}
+
 /* Interface refcount helpers — standard OS4 idiom. */
 uint32 _manager_Obtain(struct DeviceManagerInterface *Self)
 {
@@ -157,6 +187,17 @@ static void v_cleanup(struct Rtl8139ReBase *base)
 
     /* Free PCI device + BAR + TX buffer BEFORE dropping IPCI, since
      * FreeDevice/FreeResourceRange need the IPCI interface alive. */
+    /* IRQ off FIRST — before we drop the PCI resources or free the
+     * buffers the ISR references. Also mask IMR so no spurious late
+     * interrupts fire during teardown. */
+    if (base->pciDevice && base->bar_io) {
+        base->pciDevice->OutWord(base->bar_io + RTL_IMR, 0);
+    }
+    if (base->irq_installed && base->irq_vector != 0) {
+        IExec->RemIntServer(base->irq_vector, &base->irq_node);
+        base->irq_installed = FALSE;
+        base->irq_vector = 0;
+    }
     if (base->tx_buffer_raw) {
         IExec->FreeMem(base->tx_buffer_raw, base->tx_buffer_raw_size);
         base->tx_buffer_raw = NULL;
@@ -371,47 +412,79 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
                                    RTL_TX_SLOTS, RTL_TX_BUF_SIZE);
             }
 
-            /* Allocate RX ring — 8 KB + 16-byte wrap padding + a bit
-             * of slack for chip prefetch. Same MEMF_KICK|CLEAR pattern
-             * as TX; align to 32 bytes for cache-line safety. */
+#ifdef RTL_ENABLE_RX
+            /* Allocate RX ring — 8 KB + 16-byte wrap padding + slack.
+             * MEMF_KICK|MEMF_CLEAR + 32-byte manual alignment. */
             ULONG rx_total = RTL_RX_RING_SIZE + RTL_RX_RING_PAD + 64;
             base->rx_ring_raw = iexec->AllocMem(rx_total, MEMF_KICK | MEMF_CLEAR);
             base->rx_ring_raw_size = rx_total;
             base->rx_ring = base->rx_ring_raw
                 ? (APTR)(((ULONG)base->rx_ring_raw + 31UL) & ~31UL) : NULL;
             if (base->rx_ring) {
-                /* MEMF_KICK memory is identity-mapped for DMA on this
-                 * platform; CPU virt = PCI-bus phys. Don't call
-                 * StartDMA — it doesn't nest and we don't need it. */
                 base->rx_ring_phys = (ULONG)base->rx_ring;
                 iexec->DebugPrintF("[rtl8139re] rx_ring: cpu=%p phys=%08lx size=%lu\n",
                                    base->rx_ring,
                                    (unsigned long)base->rx_ring_phys,
                                    (unsigned long)RTL_RX_RING_SIZE);
-
-                /* Program RBSTART with the ring's DMA physical addr. */
                 base->pciDevice->OutLong(base->bar_io + RTL_RBSTART,
                                          base->rx_ring_phys);
-                /* Program RCR: accept-physical + accept-broadcast +
-                 * WRAP + unlimited MXDMA. RBLEN=00 selects 8KB+16. */
                 base->pciDevice->OutLong(base->bar_io + RTL_RCR,
                                          RTL_RCR_DEFAULT);
-                /* Zero CAPR (driver read pointer) — chip resets to
-                 * 0xFFF0 (= "one 16-byte block before start"), which
-                 * is the correct initial value; leave alone. */
             } else {
                 iexec->DebugPrintF("[rtl8139re] rx_ring alloc FAILED\n");
             }
+#endif
 
-            /* Enable TE + RE in ChipCmd. Also program TCR to sensible
-             * defaults (16 retries, standard IFG). Do this LAST so
-             * ring registers are programmed before the NIC starts
-             * looking at them. */
+            /* Enable TE + optionally RE in ChipCmd. Also program TCR to
+             * sensible defaults (16 retries, standard IFG). Do this LAST
+             * so ring registers are programmed before the NIC starts
+             * looking at them.
+             *
+             * RTL_ENABLE_RX gate: currently disabled while we chase down
+             * why enabling RE hangs the guest under testtx. */
             base->pciDevice->OutLong(base->bar_io + RTL_TCR, 0x03000700);
+#ifdef RTL_ENABLE_RX
             base->pciDevice->OutByte(base->bar_io + RTL_CR,
                                      RTL_CR_TE | RTL_CR_RE);
             iexec->DebugPrintF("[rtl8139re] TX+RX enabled (TCR=03000700, CR=TE|RE, RCR=%08lx)\n",
                                (unsigned long)RTL_RCR_DEFAULT);
+#else
+            base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
+            iexec->DebugPrintF("[rtl8139re] TX-only mode (RE disabled, TCR=03000700, CR=TE)\n");
+#endif
+
+            /* Ensure IRQs are masked at chip regardless of whether we
+             * install a handler. This guards against a partial-init
+             * scenario leaving IMR non-zero from a prior driver load. */
+            base->pciDevice->OutWord(base->bar_io + RTL_IMR, 0);
+
+#ifdef RTL_ENABLE_IRQ
+            /* IRQ install. MapInterrupt tells us the OS4-side vector;
+             * AddIntServer hooks our handler. Then program IMR to
+             * un-mask the causes we care about. */
+            base->irq_vector = base->pciDevice->MapInterrupt();
+            iexec->DebugPrintF("[rtl8139re] MapInterrupt: vector=%lu\n",
+                               (unsigned long)base->irq_vector);
+            if (base->irq_vector != 0) {
+                base->irq_node.is_Node.ln_Type = NT_INTERRUPT;
+                base->irq_node.is_Node.ln_Pri  = 0;
+                base->irq_node.is_Node.ln_Name = (STRPTR)DEVNAME;
+                base->irq_node.is_Data         = (APTR)base;
+                base->irq_node.is_Code         = (void (*)())rtl_isr;
+                BOOL ok = iexec->AddIntServer(base->irq_vector,
+                                              &base->irq_node);
+                base->irq_installed = ok;
+                iexec->DebugPrintF("[rtl8139re] AddIntServer(%lu) = %s\n",
+                                   (unsigned long)base->irq_vector,
+                                   ok ? "OK" : "FAIL");
+                base->pciDevice->OutWord(base->bar_io + RTL_IMR,
+                                         (UWORD)RTL_IMR_DEFAULT);
+                iexec->DebugPrintF("[rtl8139re] IMR = %04x\n",
+                                   (unsigned)RTL_IMR_DEFAULT);
+            }
+#else
+            iexec->DebugPrintF("[rtl8139re] IRQ install DISABLED (build-time)\n");
+#endif
         } else {
             iexec->DebugPrintF("[rtl8139re] GetResourceRange(0) FAILED\n");
         }
@@ -584,7 +657,6 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         /* Copy caller's frame (RAW mode — full Ethernet). */
         UBYTE *src = (UBYTE *)ioreq->ios2_Data;
         for (ULONG i = 0; i < len; i++) dst[i] = src[i];
-        /* Pad to Ethernet minimum 60 bytes. */
         for (ULONG i = len; i < 60; i++) dst[i] = 0;
         if (len < 60) len = 60;
 
@@ -597,26 +669,21 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         /* Write DMA phys addr to TSADn. */
         pd->OutLong(bar + RTL_TSAD0 + (slot * 4), dst_phys);
 
-        /* Write TSDn: length in low 13 bits, OWN=0 triggers TX.
-         * Also default early-TX-threshold (bits 16-21 = 32*256=8KB).
-         * QEMU accepts anything sensible; use 0x00030000 (256B threshold). */
-        ULONG tsd = (len & 0x1FFF) | (0x30 << 11);   /* threshold + len */
+        /* Write TSDn: length in low 13 bits, OWN=0 triggers TX,
+         * ERTXTH=0x30 (48*32=1536 bytes early threshold) in bits 16-21. */
+        ULONG tsd = (len & 0x1FFF) | (0x30 << 16);
         pd->OutLong(bar + RTL_TSD0 + (slot * 4), tsd);
 
-        /* Advance slot pointer round-robin. */
         base->tx_next_slot = (slot + 1) & 0x3;
 
-        /* Poll TSD for TOK (bit 15) or ABT/CRS/TUN (error bits).
-         * QEMU should complete quickly. Cap at ~10ms. */
+        /* Poll TSD for TOK (bit 15) or OWN (bit 29). Cap ~5000 iters. */
         BOOL done = FALSE;
         for (int i = 0; i < 5000; i++) {
             ULONG s = pd->InLong(bar + RTL_TSD0 + (slot * 4));
-            if (s & (1UL << 15)) { done = TRUE; break; }  /* TOK */
-            if (s & (1UL << 30)) break;                    /* OWN — HW returned */
+            if (s & (1UL << 15)) { done = TRUE; break; }
+            if (s & (1UL << 29)) break;
         }
-        if (!done) {
-            ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
-        }
+        if (!done) ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
         break;
     }
     case 0xE001: {  /* Private DBG_RXSTATE — pack rx-ring diagnostics */
@@ -626,12 +693,17 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         }
         struct PCIDevice *pd = base->pciDevice;
         ULONG bar = base->bar_io;
-        volatile ULONG cbr  = pd->InLong(bar + RTL_CBR);   /* also reads CAPR high half */
+        volatile ULONG cbr  = pd->InLong(bar + RTL_CBR);   /* also reads IMR high half */
         volatile ULONG isr  = pd->InLong(bar + RTL_ISR);
         volatile ULONG cr   = pd->InLong(bar + RTL_CR);
         ioreq->ios2_DataLength = cbr;
         ioreq->ios2_WireError  = isr & 0xFFFF;
         ioreq->ios2_PacketType = cr & 0xFF;
+        /* Add irq_count + last_isr as a bonus in ios2_Data field
+         * (repurposed since caller doesn't set it for this cmd). */
+        ioreq->ios2_Data = (APTR)(ULONG)base->irq_count;
+        /* Overlay ios2_StatData with last_isr. */
+        ioreq->ios2_StatData = (APTR)(ULONG)base->irq_last_isr;
         break;
     }
     default:

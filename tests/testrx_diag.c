@@ -47,12 +47,16 @@ int main(int argc, char **argv)
         ULONG cbr_imr = req->ios2_DataLength;
         ULONG isr     = req->ios2_WireError;
         ULONG cr      = req->ios2_PacketType;
-        IDOS->Printf("iter %ld: CBA=%04lx IMR=%04lx  ISR=%04lx  CR=%02lx\n",
+        ULONG irq_ct  = (ULONG)req->ios2_Data;
+        ULONG last_isr= (ULONG)req->ios2_StatData;
+        IDOS->Printf("iter %ld: CBA=%04lx IMR=%04lx  ISR=%04lx  CR=%02lx  irq_count=%lu last_isr=%04lx\n",
                      i,
                      cbr_imr & 0xFFFF,
                      (cbr_imr >> 16) & 0xFFFF,
                      isr & 0xFFFF,
-                     cr & 0xFF);
+                     cr & 0xFF,
+                     irq_ct,
+                     last_isr);
         IDOS->Delay(50);  /* 1 second */
     }
 

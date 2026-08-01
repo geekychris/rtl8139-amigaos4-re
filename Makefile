@@ -21,6 +21,7 @@ STRIP  = ppc-amigaos-strip
 # newlib/OS4 timeval-layout compat used everywhere else in the stack.
 CFLAGS = -mcrt=newlib -mhard-float -O0 -mcpu=440 -Wall -Wextra \
          -D__PPC__ -D__USE_OLD_TIMEVAL__ \
+         -DRTL_ENABLE_RX -DRTL_ENABLE_IRQ \
          -I./include
 
 # Device link line — modeled on VirtualSCSIDevice's Makefile. -nostartfiles
@@ -41,7 +42,7 @@ DEV_DBG  = $(BUILD)/rtl8139re.device.debug
 
 # Add every test binary here as it lands. Each corresponds to
 # tests/<name>.c, compiled the same way.
-TEST_NAMES = testopen offs testtx testrx_diag
+TEST_NAMES = testopen offs testtx testrx_diag testmin
 TESTS      = $(patsubst %,$(BUILD)/%,$(TEST_NAMES))
 
 DEV_SRC  = src/device.c
