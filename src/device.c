@@ -119,41 +119,49 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
         UWORD body_len = (UWORD)(length - 4);  /* strip FCS */
         UWORD ethertype = ((UWORD)body[12] << 8) | body[13];
 
-        /* Match against first opener whose packet_type matches. */
+        /* Match against first opener whose packet_type matches, else
+         * fall back to any pending S2_READORPHAN. */
         base->IExec->ObtainSemaphore(base->io_lock);
+        struct IOSana2Req *target = NULL;
+        struct Rtl8139Opener *chosen = NULL;
         struct Rtl8139Opener *op = (struct Rtl8139Opener *)base->openers.mlh_Head;
-        int delivered = 0;
         while (op && op->node.mln_Succ) {
             struct Rtl8139Opener *next =
                 (struct Rtl8139Opener *)op->node.mln_Succ;
             if (op->packet_type == ethertype) {
                 struct Node *rn = base->IExec->RemHead(&op->pending_reads);
-                if (rn) {
-                    struct IOSana2Req *r = (struct IOSana2Req *)rn;
-                    UBYTE *dst = (UBYTE *)r->ios2_Data;
-                    UWORD copy = body_len;
-                    if (r->ios2_DataLength > 0 && copy > r->ios2_DataLength)
-                        copy = (UWORD)r->ios2_DataLength;
-                    for (UWORD b = 0; b < copy; b++) dst[b] = body[b];
-                    r->ios2_DataLength = copy;
-                    for (int a = 0; a < 6; a++) {
-                        r->ios2_DstAddr[a] = body[a];
-                        r->ios2_SrcAddr[a] = body[6 + a];
-                    }
-                    r->ios2_PacketType   = ethertype;
-                    r->ios2_Req.io_Error = 0;
-                    base->IExec->ReplyMsg((struct Message *)r);
-                    op->stat_rx_pkts++;
-                    op->stat_rx_bytes += body_len;
-                    base->stats.PacketsReceived++;
-                    delivered = 1;
-                    break;
-                }
+                if (rn) { target = (struct IOSana2Req *)rn; chosen = op; break; }
             }
             op = next;
         }
+        if (!target) {
+            struct Node *rn = base->IExec->RemHead(&base->orphan_reads);
+            if (rn) target = (struct IOSana2Req *)rn;
+        }
         base->IExec->ReleaseSemaphore(base->io_lock);
-        if (!delivered) base->stats.UnknownTypesReceived++;
+
+        if (target) {
+            UBYTE *dst = (UBYTE *)target->ios2_Data;
+            UWORD copy = body_len;
+            if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
+                copy = (UWORD)target->ios2_DataLength;
+            for (UWORD b = 0; b < copy; b++) dst[b] = body[b];
+            target->ios2_DataLength = copy;
+            for (int a = 0; a < 6; a++) {
+                target->ios2_DstAddr[a] = body[a];
+                target->ios2_SrcAddr[a] = body[6 + a];
+            }
+            target->ios2_PacketType   = ethertype;
+            target->ios2_Req.io_Error = 0;
+            base->IExec->ReplyMsg((struct Message *)target);
+            base->stats.PacketsReceived++;
+            if (chosen) {
+                chosen->stat_rx_pkts++;
+                chosen->stat_rx_bytes += body_len;
+            }
+        } else {
+            base->stats.UnknownTypesReceived++;
+        }
 
         /* Advance: pkt + length + 4 header, 4-byte aligned. */
         read_off = (UWORD)((read_off + length + 4 + 3) & ~3);
@@ -350,6 +358,7 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
     base->io_lock = iexec->AllocSysObject(ASOT_SEMAPHORE, NULL);
     /* Openers list — empty until first OpenDevice runs. */
     iexec->NewMinList(&base->openers);
+    iexec->NewList(&base->orphan_reads);
 
     /* Open the three libraries. If any fails, cleanup + still return
      * the base — Open will notice and reject. dos.library at v51 is
@@ -892,11 +901,6 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         }
         break;
     case CMD_READ: {
-        /* Enqueue the request on the caller's opener; the RX dispatch
-         * will match on ios2_PacketType and copyto their buffer. If we
-         * had a working RX path this would return _replyed_ later on a
-         * matching packet. Without RE latching we queue-and-hold — a
-         * client's DoIO will block indefinitely. SendIO is fine. */
         struct Rtl8139Opener *op = (struct Rtl8139Opener *)
             ioreq->ios2_Req.io_Unit;
         if (!op || !base->is_online) {
@@ -904,16 +908,26 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
             break;
         }
-        /* Record the packet type this opener wants — later reads with
-         * different type just override; SANA-II clients typically use
-         * a single type per opener. */
         op->packet_type = ioreq->ios2_PacketType;
         base->IExec->ObtainSemaphore(base->io_lock);
         base->IExec->AddTail(&op->pending_reads,
                              (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
         base->IExec->ReleaseSemaphore(base->io_lock);
-        /* DO NOT ReplyMsg — the request is pending. Return without
-         * dropping through to the ReplyMsg at the end. */
+        ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+        return;
+    }
+    case S2_READORPHAN: {
+        /* Deliver any packet whose type isn't claimed by an opener.
+         * Roadshow / packet-sniffer style clients use this. */
+        if (!base->is_online) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        base->IExec->ObtainSemaphore(base->io_lock);
+        base->IExec->AddTail(&base->orphan_reads,
+                             (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
+        base->IExec->ReleaseSemaphore(base->io_lock);
         ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
         return;
     }
@@ -969,7 +983,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         static uint16 supported[] = {
             CMD_READ, CMD_WRITE,
             S2_DEVICEQUERY, S2_GETSTATIONADDRESS, S2_CONFIGINTERFACE,
-            S2_BROADCAST, S2_ONLINE, S2_OFFLINE,
+            S2_BROADCAST, S2_ONLINE, S2_OFFLINE, S2_READORPHAN,
             S2_GETGLOBALSTATS, S2_GETSPECIALSTATS,
             NSCMD_DEVICEQUERY,
             0

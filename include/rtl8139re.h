@@ -108,6 +108,10 @@ struct Rtl8139ReBase
      * by io_lock semaphore for list mutation. */
     struct MinList     openers;
 
+    /* Orphan-read queue — CMD_S2_READORPHAN clients get any packet
+     * whose type isn't claimed by any opener's CMD_READ. */
+    struct List        orphan_reads;
+
     /* Init-time CR readback trace (diag). Populated once during Init
      * so tests can see whether the chip actually latched TE|RE. */
     UBYTE              cr_after_init;       /* CR before any writes */
