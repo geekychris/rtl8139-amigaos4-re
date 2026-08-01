@@ -261,6 +261,8 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
 
     /* IO lock — will guard openers list + unit table once those land. */
     base->io_lock = iexec->AllocSysObject(ASOT_SEMAPHORE, NULL);
+    /* Openers list — empty until first OpenDevice runs. */
+    iexec->NewMinList(&base->openers);
 
     /* Open the three libraries. If any fails, cleanup + still return
      * the base — Open will notice and reject. dos.library at v51 is
@@ -540,10 +542,32 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
         return NULL;
     }
 
+    /* Allocate per-opener state. Each OpenDevice gets its own so
+     * different clients can request different PacketTypes on RX
+     * without stepping on each other. */
+    struct Rtl8139Opener *op = base->IExec->AllocVecTags(
+        sizeof(*op),
+        AVT_ClearWithValue, 0,
+        TAG_END);
+    if (!op) {
+        ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        return NULL;
+    }
+    op->base        = base;
+    op->reply_port  = ioreq->ios2_Req.io_Message.mn_ReplyPort;
+    op->packet_type = 0;
+    base->IExec->NewList(&op->pending_reads);
+
+    base->IExec->ObtainSemaphore(base->io_lock);
+    base->IExec->AddTail((struct List *)&base->openers, (struct Node *)&op->node);
+    base->IExec->ReleaseSemaphore(base->io_lock);
+
     base->dev_Base.dd_Library.lib_OpenCnt++;
     base->dev_Base.dd_Library.lib_Flags &= ~LIBF_DELEXP;
     ioreq->ios2_Req.io_Error = 0;
-    ioreq->ios2_Req.io_Unit  = (struct Unit *)base;   /* single unit for now */
+    /* SANA-II convention: io_Unit points at per-opener state so
+     * BeginIO can retrieve the opener without walking the list. */
+    ioreq->ios2_Req.io_Unit  = (struct Unit *)op;
     return base;
 }
 
@@ -551,6 +575,23 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self,
                     struct IOSana2Req *ioreq)
 {
     struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
+    struct Rtl8139Opener *op = (struct Rtl8139Opener *)ioreq->ios2_Req.io_Unit;
+
+    /* Detach the opener + abort any pending CMD_READs so callers
+     * unblock. Then free. Guard the list mutation with io_lock. */
+    if (op) {
+        base->IExec->ObtainSemaphore(base->io_lock);
+        base->IExec->Remove((struct Node *)&op->node);
+        struct Node *rn;
+        while ((rn = base->IExec->RemHead(&op->pending_reads)) != NULL) {
+            struct IOSana2Req *r = (struct IOSana2Req *)rn;
+            r->ios2_Req.io_Error = IOERR_ABORTED;
+            base->IExec->ReplyMsg((struct Message *)r);
+        }
+        base->IExec->ReleaseSemaphore(base->io_lock);
+        base->IExec->FreeVec(op);
+    }
+
     ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
     ioreq->ios2_Req.io_Device = (struct Device *)-1;
     base->dev_Base.dd_Library.lib_OpenCnt--;
@@ -740,6 +781,32 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
             }
         }
         break;
+    case CMD_READ: {
+        /* Enqueue the request on the caller's opener; the RX dispatch
+         * will match on ios2_PacketType and copyto their buffer. If we
+         * had a working RX path this would return _replyed_ later on a
+         * matching packet. Without RE latching we queue-and-hold — a
+         * client's DoIO will block indefinitely. SendIO is fine. */
+        struct Rtl8139Opener *op = (struct Rtl8139Opener *)
+            ioreq->ios2_Req.io_Unit;
+        if (!op || !base->is_online) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+            break;
+        }
+        /* Record the packet type this opener wants — later reads with
+         * different type just override; SANA-II clients typically use
+         * a single type per opener. */
+        op->packet_type = ioreq->ios2_PacketType;
+        base->IExec->ObtainSemaphore(base->io_lock);
+        base->IExec->AddTail(&op->pending_reads,
+                             (struct Node *)&ioreq->ios2_Req.io_Message.mn_Node);
+        base->IExec->ReleaseSemaphore(base->io_lock);
+        /* DO NOT ReplyMsg — the request is pending. Return without
+         * dropping through to the ReplyMsg at the end. */
+        ioreq->ios2_Req.io_Flags &= ~IOF_QUICK;
+        return;
+    }
     case S2_DEVICEQUERY: {
         struct Sana2DeviceQuery *q =
             (struct Sana2DeviceQuery *)ioreq->ios2_StatData;

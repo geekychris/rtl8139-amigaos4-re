@@ -101,6 +101,28 @@ struct Rtl8139ReBase
     BOOL               is_online;
     BOOL               is_configured;
     struct Sana2DeviceStats stats;
+
+    /* Opener list — each OpenDevice creates a struct Rtl8139Opener
+     * and links it here. CMD_READ requests are queued per-opener so
+     * RX dispatch can walk openers and match on PacketType. Guarded
+     * by io_lock semaphore for list mutation. */
+    struct MinList     openers;
+};
+
+/* Per-opener state — created by _manager_Open, destroyed by _Close.
+ * The client's io_Unit is set to point at this so BeginIO can find
+ * the opener directly without walking the list. */
+struct Rtl8139Opener {
+    struct MinNode     node;
+    struct MsgPort    *reply_port;   /* client's replyport for signals */
+    ULONG              packet_type;  /* set by S2_CONFIGINTERFACE */
+    struct List        pending_reads;/* CMD_READ ioreqs waiting for RX */
+    ULONG              stat_rx_pkts;
+    ULONG              stat_tx_pkts;
+    ULONG              stat_rx_bytes;
+    ULONG              stat_tx_bytes;
+    ULONG              stat_dropped;
+    struct Rtl8139ReBase *base;      /* back-pointer for BeginIO */
 };
 
 #define RTL_RX_RING_SIZE  (8 * 1024)      /* RBLEN=00 → 8 KB */
