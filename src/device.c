@@ -75,7 +75,37 @@ static uint32 rtl_isr(struct ExecBase *sysbase, struct Rtl8139ReBase *base)
     base->irq_last_isr = isr;
     pd->OutWord(bar + RTL_ISR, isr);   /* W1C — clears the bits we saw */
     pd->OutWord(bar + RTL_IMR, (UWORD)RTL_IMR_DEFAULT);
+    /* Wake unit task so it can drain the RX ring at task priority.
+     * Signal is only meaningful once unit_task + rx_sigmask are set. */
+    if (base->unit_task && base->rx_sigmask) {
+        base->IExec->Signal(base->unit_task, base->rx_sigmask);
+    }
     return 1;   /* claimed */
+}
+
+/* Forward declaration — rtl_rx_drain is defined below. */
+static void rtl_rx_drain(struct Rtl8139ReBase *base);
+
+/* Unit task entry — runs at task priority (not interrupt).
+ * Waits on rx_sigmask (set by ISR on any interrupt) OR CTRL_C
+ * (set by driver teardown to ask task to exit), drains RX, loops.
+ *
+ * Base pointer passed via AT_Param1 → arrives as first arg on PPC. */
+static void rtl_unit_task_entry(struct Rtl8139ReBase *base)
+{
+    if (!base) return;
+    struct ExecIFace *iexec = base->IExec;
+
+    ULONG stop_mask = SIGBREAKF_CTRL_C;
+    ULONG wait_mask = base->rx_sigmask | stop_mask;
+    while (!base->unit_task_stop) {
+        ULONG sigs = iexec->Wait(wait_mask);
+        if (sigs & stop_mask) break;
+        if (sigs & base->rx_sigmask) rtl_rx_drain(base);
+    }
+    iexec->Forbid();
+    base->unit_task = NULL;
+    iexec->Permit();
 }
 
 /* Walk the RX ring and dispatch received packets to matching openers.
@@ -141,18 +171,28 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
         base->IExec->ReleaseSemaphore(base->io_lock);
 
         if (target) {
-            UBYTE *dst = (UBYTE *)target->ios2_Data;
             UWORD copy = body_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            for (UWORD b = 0; b < copy; b++) dst[b] = body[b];
+            /* Copy body → client. Prefer opener's copy_to_buff hook;
+             * fall back to byte-loop memcpy if none registered. */
+            if (chosen && chosen->copy_to_buff) {
+                if (!chosen->copy_to_buff(target->ios2_Data, body, (LONG)copy)) {
+                    target->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                    target->ios2_WireError    = S2WERR_BUFF_ERROR;
+                    chosen->stat_dropped++;
+                }
+            } else {
+                UBYTE *dst = (UBYTE *)target->ios2_Data;
+                for (UWORD b = 0; b < copy; b++) dst[b] = body[b];
+            }
             target->ios2_DataLength = copy;
             for (int a = 0; a < 6; a++) {
                 target->ios2_DstAddr[a] = body[a];
                 target->ios2_SrcAddr[a] = body[6 + a];
             }
             target->ios2_PacketType   = ethertype;
-            target->ios2_Req.io_Error = 0;
+            if (!target->ios2_Req.io_Error) target->ios2_Req.io_Error = 0;
             base->IExec->ReplyMsg((struct Message *)target);
             base->stats.PacketsReceived++;
             if (chosen) {
@@ -283,6 +323,19 @@ static void v_cleanup(struct Rtl8139ReBase *base)
 
     /* Free PCI device + BAR + TX buffer BEFORE dropping IPCI, since
      * FreeDevice/FreeResourceRange need the IPCI interface alive. */
+    /* Stop unit task BEFORE removing IRQ or freeing anything the
+     * task might touch. Signal CTRL_C so its Wait returns; poll for
+     * the task nulling itself. Cap at ~1s via short IDOS->Delay. */
+    if (base->unit_task) {
+        base->unit_task_stop = 1;
+        IExec->Signal(base->unit_task, SIGBREAKF_CTRL_C);
+        for (int i = 0; i < 100 && base->unit_task; i++) {
+            if (base->IDOS) base->IDOS->Delay(1);   /* 1/50 s = 20ms */
+            else break;
+        }
+        base->unit_task = NULL;
+    }
+
     /* IRQ off FIRST — before we drop the PCI resources or free the
      * buffers the ISR references. Also mask IMR so no spurious late
      * interrupts fire during teardown. */
@@ -668,7 +721,32 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
     op->base        = base;
     op->reply_port  = ioreq->ios2_Req.io_Message.mn_ReplyPort;
     op->packet_type = 0;
+    op->copy_to_buff   = NULL;
+    op->copy_from_buff = NULL;
     base->IExec->NewList(&op->pending_reads);
+
+    /* Parse SANA-II buffer-management tags. The Roadshow convention:
+     * client sets ios2_BufferManagement to a TagItem array before
+     * OpenDevice, listing the copy-hook function pointers. If NULL
+     * or missing, driver falls back to inline byte copy in
+     * rtl_rx_drain and CMD_WRITE. */
+    if (ioreq->ios2_BufferManagement) {
+        struct TagItem *tags = (struct TagItem *)ioreq->ios2_BufferManagement;
+        struct TagItem *t;
+        struct TagItem *iter = tags;
+        while ((t = base->IUtility->NextTagItem(&iter)) != NULL) {
+            switch (t->ti_Tag) {
+            case S2_CopyToBuff:
+                op->copy_to_buff = (Rtl8139CopyHook)t->ti_Data;
+                break;
+            case S2_CopyFromBuff:
+                op->copy_from_buff = (Rtl8139CopyHook)t->ti_Data;
+                break;
+            default:
+                break;   /* ignore unknown; PacketFilter/16/32 variants TBD */
+            }
+        }
+    }
 
     base->IExec->ObtainSemaphore(base->io_lock);
     base->IExec->AddTail((struct List *)&base->openers, (struct Node *)&op->node);
@@ -814,11 +892,27 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         UBYTE *dst = (UBYTE *)base->tx_buffer + (slot * RTL_TX_BUF_SIZE);
         ULONG dst_phys = base->tx_buffer_phys + (slot * RTL_TX_BUF_SIZE);
 
-        /* Copy caller's frame (RAW mode — full Ethernet). */
-        UBYTE *src = (UBYTE *)ioreq->ios2_Data;
-        for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+        /* Copy caller's frame to TX buffer. Prefer opener's
+         * copy_from_buff hook; fall back to byte-loop memcpy. */
+        struct Rtl8139Opener *tx_op = (struct Rtl8139Opener *)
+            ioreq->ios2_Req.io_Unit;
+        if (tx_op && tx_op->copy_from_buff) {
+            if (!tx_op->copy_from_buff(dst, ioreq->ios2_Data, (LONG)len)) {
+                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+                break;
+            }
+        } else {
+            UBYTE *src = (UBYTE *)ioreq->ios2_Data;
+            for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+        }
         for (ULONG i = len; i < 60; i++) dst[i] = 0;
         if (len < 60) len = 60;
+        if (tx_op) {
+            tx_op->stat_tx_pkts++;
+            tx_op->stat_tx_bytes += len;
+        }
+        base->stats.PacketsSent++;
 
         /* Flush cache before doorbell. */
         base->IExec->CacheClearE(dst, len, CACRF_ClearD);
@@ -877,10 +971,32 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         } else {
             base->is_online = TRUE;
             base->stats.Reconfigurations++;
+            /* Start unit task if not already running. Task drains RX
+             * ring on ISR signal at task priority.
+             *
+             * Signal choice: use SIGBREAKF_CTRL_E as the RX-wake
+             * signal (fixed, not AllocSignal — AllocSignal has to
+             * run in the target task's context which complicates
+             * cross-task setup). CTRL_C reserved for stop.
+             * Cost: don't Break -e to rtl8139re.rx from the console. */
+            if (!base->unit_task) {
+                base->unit_task_stop = 0;
+                base->rx_sigmask = SIGBREAKF_CTRL_E;
+                base->unit_task = (struct Task *)
+                    base->IExec->CreateTaskTags(
+                        (STRPTR)"rtl8139re.rx",
+                        1,                         /* priority */
+                        (APTR)rtl_unit_task_entry,
+                        8192,                       /* stack */
+                        AT_Param1, (ULONG)base,
+                        TAG_END);
+            }
         }
         break;
     case S2_OFFLINE:
         base->is_online = FALSE;
+        /* Do NOT tear down unit task here — allow later S2_ONLINE
+         * to resume. Task is fully torn down in v_cleanup. */
         break;
     case S2_CONFIGINTERFACE:
         if (!base->hw_present) {

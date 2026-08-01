@@ -94,6 +94,14 @@ struct Rtl8139ReBase
     volatile ULONG     irq_count;         /* total ISR fires */
     volatile ULONG     irq_last_isr;      /* last ISR value seen */
 
+    /* Unit task — background task started at first S2_ONLINE. Waits
+     * on a signal from the ISR (rtl_isr sets rx_signal), drains the
+     * RX ring, dispatches to openers. Uses SIGBREAKF_CTRL_C for a
+     * termination signal at Expunge/Offline. */
+    struct Task       *unit_task;
+    ULONG              rx_sigmask;         /* AllocSignal on unit_task */
+    volatile ULONG     unit_task_stop;     /* set to nonzero to ask task to exit */
+
     /* SANA-II state — is_online is toggled by S2_ONLINE/S2_OFFLINE;
      * openers may not TX until online. is_configured tracks
      * S2_CONFIGINTERFACE completion. stats is the target of
@@ -120,6 +128,11 @@ struct Rtl8139ReBase
     UBYTE              cr_after_re_rewrite; /* after 2nd write of TE|RE */
 };
 
+/* SANA-II copy hooks. Client passes function pointers via a TagItem
+ * array anchored at ios2_BufferManagement on OpenDevice. See
+ * devices/sana2.h S2_CopyToBuff / S2_CopyFromBuff tag IDs. */
+typedef BOOL (*Rtl8139CopyHook)(APTR to, APTR from, LONG size);
+
 /* Per-opener state — created by _manager_Open, destroyed by _Close.
  * The client's io_Unit is set to point at this so BeginIO can find
  * the opener directly without walking the list. */
@@ -128,6 +141,11 @@ struct Rtl8139Opener {
     struct MsgPort    *reply_port;   /* client's replyport for signals */
     ULONG              packet_type;  /* set by S2_CONFIGINTERFACE */
     struct List        pending_reads;/* CMD_READ ioreqs waiting for RX */
+    /* Client-supplied copy hooks. If NULL, fall back to inline memcpy.
+     * copy_to_buff: driver → client (used on RX)
+     * copy_from_buff: client → driver (used on TX) */
+    Rtl8139CopyHook    copy_to_buff;
+    Rtl8139CopyHook    copy_from_buff;
     ULONG              stat_rx_pkts;
     ULONG              stat_tx_pkts;
     ULONG              stat_rx_bytes;
