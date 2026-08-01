@@ -93,6 +93,14 @@ struct Rtl8139ReBase
     BOOL               irq_installed;
     volatile ULONG     irq_count;         /* total ISR fires */
     volatile ULONG     irq_last_isr;      /* last ISR value seen */
+
+    /* SANA-II state — is_online is toggled by S2_ONLINE/S2_OFFLINE;
+     * openers may not TX until online. is_configured tracks
+     * S2_CONFIGINTERFACE completion. stats is the target of
+     * S2_GETGLOBALSTATS. */
+    BOOL               is_online;
+    BOOL               is_configured;
+    struct Sana2DeviceStats stats;
 };
 
 #define RTL_RX_RING_SIZE  (8 * 1024)      /* RBLEN=00 → 8 KB */

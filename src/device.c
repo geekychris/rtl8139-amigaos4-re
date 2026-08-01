@@ -13,6 +13,7 @@
 #include "rtl8139re.h"
 #include "version.h"
 
+#include <devices/newstyle.h>
 #include <exec/exectags.h>
 #include <exec/interfaces.h>
 #include <exec/resident.h>
@@ -446,11 +447,14 @@ struct Library *_manager_Init(struct Library *library, BPTR seglist,
 #ifdef RTL_ENABLE_RX
             base->pciDevice->OutByte(base->bar_io + RTL_CR,
                                      RTL_CR_TE | RTL_CR_RE);
-            iexec->DebugPrintF("[rtl8139re] TX+RX enabled (TCR=03000700, CR=TE|RE, RCR=%08lx)\n",
-                               (unsigned long)RTL_RCR_DEFAULT);
+            {
+                ULONG cr_rb = base->pciDevice->InLong(base->bar_io + RTL_CR);
+                iexec->DebugPrintF("[rtl8139re] CR wrote %02x, readback %02x\n",
+                                   (unsigned)(RTL_CR_TE | RTL_CR_RE),
+                                   (unsigned)(cr_rb & 0xFF));
+            }
 #else
             base->pciDevice->OutByte(base->bar_io + RTL_CR, RTL_CR_TE);
-            iexec->DebugPrintF("[rtl8139re] TX-only mode (RE disabled, TCR=03000700, CR=TE)\n");
 #endif
 
             /* Ensure IRQs are masked at chip regardless of whether we
@@ -704,6 +708,105 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         ioreq->ios2_Data = (APTR)(ULONG)base->irq_count;
         /* Overlay ios2_StatData with last_isr. */
         ioreq->ios2_StatData = (APTR)(ULONG)base->irq_last_isr;
+        break;
+    }
+    case S2_ONLINE:
+        if (!base->hw_present) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+        } else {
+            base->is_online = TRUE;
+            base->stats.Reconfigurations++;
+        }
+        break;
+    case S2_OFFLINE:
+        base->is_online = FALSE;
+        break;
+    case S2_CONFIGINTERFACE:
+        if (!base->hw_present) {
+            ioreq->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+            ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
+        } else if (base->is_configured) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_STATE;
+            ioreq->ios2_WireError    = S2WERR_IS_CONFIGURED;
+        } else {
+            base->is_configured = TRUE;
+            base->is_online     = TRUE;
+            /* Return current MAC in DstAddr per SANA-II convention.
+             * Caller may set SrcAddr to override; we ignore for now
+             * (RTL8139 MAC change requires 9346CR programming). */
+            for (int i = 0; i < 6; i++) {
+                ioreq->ios2_DstAddr[i] = base->mac[i];
+            }
+        }
+        break;
+    case S2_DEVICEQUERY: {
+        struct Sana2DeviceQuery *q =
+            (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
+        if (!q || q->SizeAvailable < sizeof(*q)) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
+        } else {
+            q->SizeSupplied   = sizeof(*q);
+            q->DevQueryFormat = 0;
+            q->DeviceLevel    = 0;
+            q->AddrFieldSize  = 48;               /* 48-bit MAC */
+            q->MTU            = 1500;
+            q->BPS            = 100 * 1000 * 1000;/* 100 Mbps rtl8139c */
+            q->HardwareType   = S2WireType_Ethernet;
+            q->RawMTU         = 1514;             /* MTU + eth header */
+        }
+        break;
+    }
+    case S2_GETGLOBALSTATS: {
+        struct Sana2DeviceStats *s =
+            (struct Sana2DeviceStats *)ioreq->ios2_StatData;
+        if (!s) {
+            ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+            ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
+        } else {
+            /* Field-by-field copy — struct-assign would emit a memcpy
+             * call which we can't link against in a resident .device. */
+            s->PacketsReceived      = base->stats.PacketsReceived;
+            s->PacketsSent          = base->stats.PacketsSent;
+            s->BadData              = base->stats.BadData;
+            s->Overruns             = base->stats.Overruns;
+            s->Unused               = base->stats.Unused;
+            s->UnknownTypesReceived = base->stats.UnknownTypesReceived;
+            s->Reconfigurations     = base->stats.Reconfigurations;
+            s->LastStart            = base->stats.LastStart;
+        }
+        break;
+    }
+    case S2_GETSPECIALSTATS: {
+        struct Sana2SpecialStatHeader *h =
+            (struct Sana2SpecialStatHeader *)ioreq->ios2_StatData;
+        if (h) h->RecordCountSupplied = 0;
+        break;
+    }
+    case NSCMD_DEVICEQUERY: {
+        struct NSDeviceQueryResult *q =
+            (struct NSDeviceQueryResult *)ioreq->ios2_Data;
+        /* 0-terminated command list Roadshow scans. Must be static
+         * so the pointer we return stays valid after we ReplyMsg. */
+        static uint16 supported[] = {
+            CMD_READ, CMD_WRITE,
+            S2_DEVICEQUERY, S2_GETSTATIONADDRESS, S2_CONFIGINTERFACE,
+            S2_BROADCAST, S2_ONLINE, S2_OFFLINE,
+            S2_GETGLOBALSTATS, S2_GETSPECIALSTATS,
+            NSCMD_DEVICEQUERY,
+            0
+        };
+        if (!q || ioreq->ios2_DataLength < sizeof(*q)) {
+            ioreq->ios2_Req.io_Error = IOERR_BADLENGTH;
+        } else {
+            q->DevQueryFormat    = 0;
+            q->SizeAvailable     = sizeof(*q);
+            q->DeviceType        = NSDEVTYPE_SANA2;
+            q->DeviceSubType     = 0;
+            q->SupportedCommands = supported;
+            ioreq->ios2_DataLength = sizeof(*q);
+        }
         break;
     }
     default:
