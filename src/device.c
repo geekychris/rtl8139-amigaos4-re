@@ -856,6 +856,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
     ioreq->ios2_Req.io_Error = 0;
     ioreq->ios2_WireError    = 0;
 
+    /* Trace every BeginIO invocation — bumps count + records the
+     * cmd code in a ring. Diagnoses whether Roadshow calls us. */
+    base->beginio_count++;
+    base->beginio_last_cmds[base->beginio_ring_head] = ioreq->ios2_Req.io_Command;
+    base->beginio_ring_head = (UBYTE)((base->beginio_ring_head + 1) & 0xF);
+
     /* Client-driven RX drain — process any pending frames before we
      * handle this command. Later this should move to a unit task
      * signalled from the ISR. */
@@ -916,9 +922,28 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
             ioreq->ios2_WireError    = S2WERR_UNIT_OFFLINE;
             break;
         }
+        /* Debug capture: every CMD_WRITE / S2_BROADCAST call, record
+         * the key inputs into base so DBG_TXTRACE (0xE003) can dump
+         * them without needing sashimi. */
+        base->tx_call_count++;
+        base->tx_last_len   = ioreq->ios2_DataLength;
+        base->tx_last_ptype = ioreq->ios2_PacketType;
+        base->tx_last_cmd   = ioreq->ios2_Req.io_Command;
+        base->tx_last_err   = 0;
+        base->tx_last_wire  = 0;
+        for (int i = 0; i < 6; i++) base->tx_last_dst[i] = ioreq->ios2_DstAddr[i];
+        if (ioreq->ios2_Data) {
+            UBYTE *sp = (UBYTE *)ioreq->ios2_Data;
+            ULONG cap = ioreq->ios2_DataLength;
+            if (cap > 16) cap = 16;
+            for (ULONG i = 0; i < cap; i++) base->tx_data0_16[i] = sp[i];
+            for (ULONG i = cap; i < 16; i++) base->tx_data0_16[i] = 0;
+        }
+
         ULONG len = ioreq->ios2_DataLength;
         if (len == 0 || len > 1514 || !ioreq->ios2_Data) {
             ioreq->ios2_Req.io_Error = S2ERR_MTU_EXCEEDED;
+            base->tx_last_err = S2ERR_MTU_EXCEEDED;
             break;
         }
 
@@ -996,7 +1021,43 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
             if (s & (1UL << 15)) { done = TRUE; break; }
             if (s & (1UL << 29)) break;
         }
-        if (!done) ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
+        if (!done) {
+            ioreq->ios2_Req.io_Error = IOERR_UNITBUSY;
+            base->tx_last_err = IOERR_UNITBUSY;
+        }
+        base->tx_last_wire = len;
+        break;
+    }
+    case 0xE004: {  /* Private DBG_BIOTRACE — dump BeginIO call trace */
+        /* ios2_DataLength = total count.
+         * ios2_WireError/PacketType/Data/StatData = 4 packed ULONGs
+         * each holding 2 UWORD cmd codes (8 total). Ring head-relative
+         * so oldest first. */
+        ioreq->ios2_DataLength = base->beginio_count;
+        UWORD h = base->beginio_ring_head;
+        UWORD cmds[8];
+        for (int i = 0; i < 8; i++) {
+            cmds[i] = base->beginio_last_cmds[(h + i) & 0xF];
+        }
+        ioreq->ios2_WireError  = ((ULONG)cmds[0] << 16) | cmds[1];
+        ioreq->ios2_PacketType = ((ULONG)cmds[2] << 16) | cmds[3];
+        ioreq->ios2_Data       = (APTR)(((ULONG)cmds[4] << 16) | cmds[5]);
+        ioreq->ios2_StatData   = (APTR)(((ULONG)cmds[6] << 16) | cmds[7]);
+        break;
+    }
+    case 0xE003: {  /* Private DBG_TXTRACE — dump last CMD_WRITE state */
+        ioreq->ios2_DataLength = base->tx_call_count;
+        ioreq->ios2_WireError  = base->tx_last_len;
+        ioreq->ios2_PacketType = base->tx_last_ptype;
+        ioreq->ios2_Data       = (APTR)base->tx_last_cmd;
+        ioreq->ios2_StatData   = (APTR)base->tx_last_err;
+        /* Pack first 6 bytes of dst into DstAddr[0..5], first 6 of
+         * data0_16 into SrcAddr[0..5]. Return wire len via a
+         * separate field abuse — use ios2_Req.io_Actual… actually
+         * that doesn't exist on IORequest. Just squeeze into DstAddr's
+         * unused-by-us upper bytes… too clever. Skip wire for now. */
+        for (int i = 0; i < 6; i++) ioreq->ios2_DstAddr[i] = base->tx_last_dst[i];
+        for (int i = 0; i < 6; i++) ioreq->ios2_SrcAddr[i] = base->tx_data0_16[i];
         break;
     }
     case 0xE001: {  /* Private DBG_RXSTATE — pack rx-ring diagnostics */

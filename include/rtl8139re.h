@@ -120,6 +120,27 @@ struct Rtl8139ReBase
      * whose type isn't claimed by any opener's CMD_READ. */
     struct List        orphan_reads;
 
+    /* BeginIO general trace — every command Roadshow (or anyone) sends
+     * bumps beginio_count and stashes the last N command codes in a
+     * ring so we can see what's being called. */
+    volatile ULONG     beginio_count;
+    volatile UWORD     beginio_last_cmds[16];  /* ring of last 16 cmd codes */
+    volatile UBYTE     beginio_ring_head;
+    volatile UBYTE     _pad_bio[1];
+
+    /* CMD_WRITE trace — captures the last N calls' key inputs so
+     * we can diagnose whether Roadshow is calling us and with what.
+     * Ring-buffered; DBG_TXTRACE returns most recent record. */
+    volatile ULONG     tx_call_count;   /* total CMD_WRITE entries */
+    volatile ULONG     tx_last_len;     /* ios2_DataLength */
+    volatile ULONG     tx_last_ptype;   /* ios2_PacketType */
+    volatile ULONG     tx_last_cmd;     /* ios2_Req.io_Command */
+    volatile ULONG     tx_last_err;     /* what we set io_Error to */
+    volatile ULONG     tx_last_wire;    /* frame_len sent to chip */
+    volatile UBYTE     tx_last_dst[6];  /* ios2_DstAddr */
+    volatile UBYTE     tx_data0_16[16]; /* first 16 bytes of ios2_Data */
+    volatile UBYTE     _pad_txtrace[2];
+
     /* Multicast hash filter — MAR0-7 (BAR+0x08..0x0F) on RTL8139.
      * Each multicast MAC's high 6 bits of CRC-32 index into this
      * 64-bit table. Enabled by RCR bit 2 (AM). We track the raw
