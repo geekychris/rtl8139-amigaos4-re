@@ -819,6 +819,14 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self,
     ioreq->ios2_Req.io_Unit   = (struct Unit *)-1;
     ioreq->ios2_Req.io_Device = (struct Device *)-1;
     base->dev_Base.dd_Library.lib_OpenCnt--;
+    /* Reset SANA-II per-Open state when the last opener closes so
+     * the next OpenDevice + S2_CONFIGINTERFACE cycle starts clean.
+     * Without this, Roadshow's NetInterface remove+add sequence sees
+     * S2ERR_BAD_STATE on re-config and gives up silently. */
+    if (base->dev_Base.dd_Library.lib_OpenCnt == 0) {
+        base->is_configured = FALSE;
+        base->is_online     = FALSE;
+    }
     if (base->dev_Base.dd_Library.lib_OpenCnt == 0 &&
         (base->dev_Base.dd_Library.lib_Flags & LIBF_DELEXP)) {
         return _manager_Expunge(Self);
@@ -1029,15 +1037,20 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         break;
     }
     case 0xE004: {  /* Private DBG_BIOTRACE — dump BeginIO call trace */
-        /* ios2_DataLength = total count.
-         * ios2_WireError/PacketType/Data/StatData = 4 packed ULONGs
-         * each holding 2 UWORD cmd codes (8 total). Ring head-relative
-         * so oldest first. */
+        /* Dump last 8 cmd codes, oldest first. If count < 8, start
+         * from index 0 (ring not full yet). If count >= 8, start at
+         * (head - 8) & 0xF (last 8 entries of a 16-slot ring, though
+         * we only expose 8 of the 16 tracked). */
         ioreq->ios2_DataLength = base->beginio_count;
-        UWORD h = base->beginio_ring_head;
+        UWORD start;
+        if (base->beginio_count < 16) {
+            start = 0;   /* linear from index 0 */
+        } else {
+            start = (UWORD)((base->beginio_ring_head - 8) & 0xF);
+        }
         UWORD cmds[8];
         for (int i = 0; i < 8; i++) {
-            cmds[i] = base->beginio_last_cmds[(h + i) & 0xF];
+            cmds[i] = base->beginio_last_cmds[(start + i) & 0xF];
         }
         ioreq->ios2_WireError  = ((ULONG)cmds[0] << 16) | cmds[1];
         ioreq->ios2_PacketType = ((ULONG)cmds[2] << 16) | cmds[3];
