@@ -189,6 +189,11 @@ struct Rtl8139Opener {
     APTR               copy_from_buff;
     ULONG              copy_to_tag;   /* S2_CopyToBuff / 16 / 32 or 0 */
     ULONG              copy_from_tag;
+    /* Roadshow-preferred: single sana2_hook services multiple methods
+     * via CallHookPkt + SANA2CopyHookMsg. Installed via S2_SANA2HOOK
+     * (0xC008). When set, takes precedence over copy_to/from_buff. */
+    struct Hook       *sana2_hook;
+    APTR               sana2_hook_methods;
     ULONG              stat_rx_pkts;
     ULONG              stat_tx_pkts;
     ULONG              stat_rx_bytes;

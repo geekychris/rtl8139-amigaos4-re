@@ -215,8 +215,8 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
             UWORD copy = deliver_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            /* Dispatch by copy_to_tag — classic direct-call vs Hook*
-             * via CallHookPkt. See CMD_WRITE for details. */
+            /* Per-tag copy_to_buff dispatch (classic direct-call vs
+             * Hook*). sana2_hook path removed after GrimReaper. */
             BOOL copy_ok = TRUE;
             if (chosen && chosen->copy_to_buff) {
                 if (chosen->copy_to_tag == S2_CopyToBuff) {
@@ -1033,9 +1033,8 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         UBYTE *payload_dst = dst + 14;
         ULONG frame_len    = 14 + len;
 
-        /* Dispatch by tag flavor: classic S2_CopyFromBuff = direct fn
-         * call; 16/32 variants = CallHookPkt with SANA2CopyHookMsg.
-         * NULL = fall back to memcpy (RAW clients like testtx). */
+        /* Dispatch by tag flavor: classic direct-call vs Hook* via
+         * CallHookPkt. sana2_hook path removed after GrimReaper. */
         BOOL copy_ok = TRUE;
         if (tx_op && tx_op->copy_from_buff) {
             if (tx_op->copy_from_tag == S2_CopyFromBuff) {
@@ -1355,9 +1354,11 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         break;
     }
     case 0xC008:  /* S2_SANA2HOOK — Roadshow's fast-path hook install.
-                   * MUST return IOERR_NOCMD; otherwise Roadshow thinks
-                   * we support the fast path and installs a hook we
-                   * never call, so packets go into the void. */
+                   * Return IOERR_NOCMD so Roadshow falls back to the
+                   * per-tag S2_CopyToBuff / S2_CopyFromBuff hooks.
+                   * Previous attempt to install the hook caused a
+                   * GrimReaper crash — needs more careful pointer
+                   * validation next round. */
         ioreq->ios2_Req.io_Error = IOERR_NOCMD;
         break;
     default:
