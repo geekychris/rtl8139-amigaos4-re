@@ -200,24 +200,29 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
         base->IExec->ReleaseSemaphore(base->io_lock);
 
         if (target) {
-            UWORD copy = body_len;
+            /* Matched-opener delivery = COOKED (strip 14-byte ETH hdr).
+             * Orphan-queue delivery = RAW (full frame) since orphan
+             * consumers may want raw. */
+            UBYTE *deliver_from;
+            UWORD  deliver_len;
+            if (chosen) {
+                deliver_from = body + 14;
+                deliver_len  = body_len > 14 ? (UWORD)(body_len - 14) : 0;
+            } else {
+                deliver_from = body;
+                deliver_len  = body_len;
+            }
+            UWORD copy = deliver_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            /* Copy body → client. Prefer opener's copy_to_buff hook;
-             * fall back to byte-loop memcpy if none registered. */
-            if (chosen && chosen->copy_to_buff) {
-                if (!chosen->copy_to_buff(target->ios2_Data, body, (LONG)copy)) {
-                    target->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-                    target->ios2_WireError    = S2WERR_BUFF_ERROR;
-                    chosen->stat_dropped++;
-                }
-            } else {
+            /* TEMP: always memcpy, bypass copy hook. */
+            {
                 UBYTE *dst = (UBYTE *)target->ios2_Data;
-                for (UWORD b = 0; b < copy; b++) dst[b] = body[b];
+                for (UWORD b = 0; b < copy; b++) dst[b] = deliver_from[b];
             }
             target->ios2_DataLength = copy;
             for (int a = 0; a < 6; a++) {
-                target->ios2_DstAddr[a] = body[a];
+                target->ios2_DstAddr[a] = body[a];       /* from ETH header */
                 target->ios2_SrcAddr[a] = body[6 + a];
             }
             target->ios2_PacketType   = ethertype;
@@ -226,7 +231,7 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
             base->stats.PacketsReceived++;
             if (chosen) {
                 chosen->stat_rx_pkts++;
-                chosen->stat_rx_bytes += body_len;
+                chosen->stat_rx_bytes += deliver_len;
             }
         } else {
             base->stats.UnknownTypesReceived++;
@@ -921,22 +926,47 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         UBYTE *dst = (UBYTE *)base->tx_buffer + (slot * RTL_TX_BUF_SIZE);
         ULONG dst_phys = base->tx_buffer_phys + (slot * RTL_TX_BUF_SIZE);
 
-        /* Copy caller's frame to TX buffer. Prefer opener's
-         * copy_from_buff hook; fall back to byte-loop memcpy. */
+        /* MODE DETECTION: SANA-II supports RAW (client supplies full
+         * Ethernet frame in ios2_Data) and COOKED (client supplies
+         * payload only + ios2_DstAddr + ios2_PacketType). io_Flags's
+         * SANA2IOF_RAW gets wiped by DoIO on this stack, so use
+         * PacketType as the heuristic: nonzero = cooked, zero = raw.
+         * testtx sends raw (PacketType=0), Roadshow sends cooked. */
         struct Rtl8139Opener *tx_op = (struct Rtl8139Opener *)
             ioreq->ios2_Req.io_Unit;
-        if (tx_op && tx_op->copy_from_buff) {
-            if (!tx_op->copy_from_buff(dst, ioreq->ios2_Data, (LONG)len)) {
-                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
-                break;
+        BOOL cooked = (ioreq->ios2_PacketType != 0);
+        UBYTE *payload_dst;
+        ULONG frame_len;
+
+        if (cooked) {
+            /* Build ETH header from request fields. */
+            if (ioreq->ios2_Req.io_Command == S2_BROADCAST) {
+                for (int i = 0; i < 6; i++) dst[i] = 0xFF;
+            } else {
+                for (int i = 0; i < 6; i++) dst[i] = ioreq->ios2_DstAddr[i];
             }
+            for (int i = 0; i < 6; i++) dst[6 + i] = base->mac[i];
+            dst[12] = (UBYTE)((ioreq->ios2_PacketType >> 8) & 0xFF);
+            dst[13] = (UBYTE)( ioreq->ios2_PacketType       & 0xFF);
+            payload_dst = dst + 14;
+            frame_len   = 14 + len;
         } else {
-            UBYTE *src = (UBYTE *)ioreq->ios2_Data;
-            for (ULONG i = 0; i < len; i++) dst[i] = src[i];
+            /* Raw: client's data starts with ETH header. */
+            payload_dst = dst;
+            frame_len   = len;
         }
-        for (ULONG i = len; i < 60; i++) dst[i] = 0;
-        if (len < 60) len = 60;
+
+        /* TEMP: bypass copy hooks — Roadshow's hook signature/semantics
+         * may differ from our assumption; always memcpy. Revisit once
+         * ping via Roadshow works. */
+        {
+            UBYTE *src = (UBYTE *)ioreq->ios2_Data;
+            for (ULONG i = 0; i < len; i++) payload_dst[i] = src[i];
+        }
+        (void)tx_op;
+        for (ULONG i = frame_len; i < 60; i++) dst[i] = 0;
+        if (frame_len < 60) frame_len = 60;
+        len = frame_len;   /* wire length that goes to the chip */
         if (tx_op) {
             tx_op->stat_tx_pkts++;
             tx_op->stat_tx_bytes += len;
