@@ -1276,12 +1276,10 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         break;
     }
     case 0xC008:  /* S2_SANA2HOOK — Roadshow's fast-path hook install.
-                   * Undocumented; some drivers return success + noop
-                   * (which tells Roadshow to fall back to normal
-                   * CMD_READ/CMD_WRITE dispatch). Returning IOERR_NOCMD
-                   * has been observed to make Roadshow give up on the
-                   * interface. */
-        /* Accept-but-noop: don't set io_Error. */
+                   * MUST return IOERR_NOCMD; otherwise Roadshow thinks
+                   * we support the fast path and installs a hook we
+                   * never call, so packets go into the void. */
+        ioreq->ios2_Req.io_Error = IOERR_NOCMD;
         break;
     default:
         ioreq->ios2_Req.io_Error = IOERR_NOCMD;
