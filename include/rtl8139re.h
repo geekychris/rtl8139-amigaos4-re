@@ -120,6 +120,14 @@ struct Rtl8139ReBase
      * whose type isn't claimed by any opener's CMD_READ. */
     struct List        orphan_reads;
 
+    /* Multicast hash filter — MAR0-7 (BAR+0x08..0x0F) on RTL8139.
+     * Each multicast MAC's high 6 bits of CRC-32 index into this
+     * 64-bit table. Enabled by RCR bit 2 (AM). We track the raw
+     * table + a refcount per bit so a Del only clears when all
+     * openers have released it. */
+    UBYTE              mar[8];
+    UBYTE              mar_refs[64];
+
     /* Init-time CR readback trace (diag). Populated once during Init
      * so tests can see whether the chip actually latched TE|RE. */
     UBYTE              cr_after_init;       /* CR before any writes */
@@ -169,7 +177,7 @@ struct Rtl8139Opener {
 
 /* Sensible default RCR: broadcast + physical match + wrap-pad-16 +
  * unlimited DMA burst. Add AAP for promiscuous / debugging. */
-#define RTL_RCR_DEFAULT   (RTL_RCR_APM | RTL_RCR_AB | RTL_RCR_WRAP | RTL_RCR_MXDMA_UNLIMITED)
+#define RTL_RCR_DEFAULT   (RTL_RCR_APM | RTL_RCR_AB | RTL_RCR_AM | RTL_RCR_WRAP | RTL_RCR_MXDMA_UNLIMITED)
 
 /* RTL8139 ISR / IMR bits (both registers share layout, at BAR+0x3C
  * and BAR+0x3E respectively — u16). Writing 1 to an ISR bit clears

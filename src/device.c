@@ -108,6 +108,35 @@ static void rtl_unit_task_entry(struct Rtl8139ReBase *base)
     iexec->Permit();
 }
 
+/* CRC-32 (Ethernet polynomial 0xEDB88320) for the 6-byte multicast MAC.
+ * RTL8139 hashes into MAR0..7 (64 bits) using the top 6 bits of the
+ * CRC. Reference: Linux 8139too driver ether_crc(). */
+static ULONG rtl_ether_crc(const UBYTE *mac)
+{
+    ULONG crc = 0xFFFFFFFFUL;
+    for (int i = 0; i < 6; i++) {
+        crc ^= mac[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0);
+    }
+    return crc;
+}
+
+/* Push the software MAR mirror to the chip. Called after add/del. */
+static void rtl_mar_flush(struct Rtl8139ReBase *base)
+{
+    if (!base->pciDevice || !base->bar_io) return;
+    /* MAR0-7 are 8 individual bytes at BAR+0x08..0x0F. Program via
+     * two OutLong writes (0x08 and 0x0C) — the chip accepts either
+     * byte or long access on these. Long is faster + atomic. */
+    ULONG lo = ((ULONG)base->mar[0]) | ((ULONG)base->mar[1] << 8) |
+               ((ULONG)base->mar[2] << 16) | ((ULONG)base->mar[3] << 24);
+    ULONG hi = ((ULONG)base->mar[4]) | ((ULONG)base->mar[5] << 8) |
+               ((ULONG)base->mar[6] << 16) | ((ULONG)base->mar[7] << 24);
+    base->pciDevice->OutLong(base->bar_io + RTL_MAR0, lo);
+    base->pciDevice->OutLong(base->bar_io + RTL_MAR0 + 4, hi);
+}
+
 /* Walk the RX ring and dispatch received packets to matching openers.
  * Called from BeginIO after any client-initiated command (client-
  * driven drain — no unit task yet). Non-reentrant; assumes caller is
@@ -1091,6 +1120,31 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         if (h) h->RecordCountSupplied = 0;
         break;
     }
+    case S2_ADDMULTICASTADDRESS: {
+        /* SrcAddr[0..5] = multicast MAC to accept. Hash via CRC-32
+         * top 6 bits → index into 64-bit MAR table; bump refcount;
+         * flush to chip if the bit's first ref. */
+        ULONG crc = rtl_ether_crc(ioreq->ios2_SrcAddr);
+        UBYTE idx = (UBYTE)(crc >> 26);          /* top 6 bits */
+        base->IExec->ObtainSemaphore(base->io_lock);
+        if (base->mar_refs[idx]++ == 0) {
+            base->mar[idx >> 3] |= (UBYTE)(1 << (idx & 7));
+            rtl_mar_flush(base);
+        }
+        base->IExec->ReleaseSemaphore(base->io_lock);
+        break;
+    }
+    case S2_DELMULTICASTADDRESS: {
+        ULONG crc = rtl_ether_crc(ioreq->ios2_SrcAddr);
+        UBYTE idx = (UBYTE)(crc >> 26);
+        base->IExec->ObtainSemaphore(base->io_lock);
+        if (base->mar_refs[idx] > 0 && --base->mar_refs[idx] == 0) {
+            base->mar[idx >> 3] &= (UBYTE)~(1 << (idx & 7));
+            rtl_mar_flush(base);
+        }
+        base->IExec->ReleaseSemaphore(base->io_lock);
+        break;
+    }
     case NSCMD_DEVICEQUERY: {
         struct NSDeviceQueryResult *q =
             (struct NSDeviceQueryResult *)ioreq->ios2_Data;
@@ -1100,6 +1154,7 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
             CMD_READ, CMD_WRITE,
             S2_DEVICEQUERY, S2_GETSTATIONADDRESS, S2_CONFIGINTERFACE,
             S2_BROADCAST, S2_ONLINE, S2_OFFLINE, S2_READORPHAN,
+            S2_ADDMULTICASTADDRESS, S2_DELMULTICASTADDRESS,
             S2_GETGLOBALSTATS, S2_GETSPECIALSTATS,
             NSCMD_DEVICEQUERY,
             0
