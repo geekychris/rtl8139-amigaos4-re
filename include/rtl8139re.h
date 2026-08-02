@@ -120,6 +120,12 @@ struct Rtl8139ReBase
      * whose type isn't claimed by any opener's CMD_READ. */
     struct List        orphan_reads;
 
+    /* Open/Close trace — separate from BeginIO because they're lib calls
+     * not device commands. */
+    volatile ULONG     open_count;      /* every _manager_Open call */
+    volatile ULONG     close_count;     /* every _manager_Close call */
+    volatile ULONG     open_last_err;   /* io_Error we set on Open */
+
     /* BeginIO general trace — every command Roadshow (or anyone) sends
      * bumps beginio_count and stashes the last N command codes in a
      * ring so we can see what's being called. */

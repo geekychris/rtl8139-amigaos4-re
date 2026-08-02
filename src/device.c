@@ -721,10 +721,13 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
 {
     (void)flags;
     struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
+    base->open_count++;
+    base->open_last_err = 0;
 
     /* Refuse if Init didn't complete (any required libs/ifaces missing). */
     if (!base->IDOS || !base->IExpansion || !base->IUtility || !base->IPCI) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        base->open_last_err = IOERR_OPENFAIL;
         return NULL;
     }
 
@@ -732,12 +735,14 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
      * many RTL8139s in one system). */
     if (unitNum > 7) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        base->open_last_err = IOERR_OPENFAIL;
         return NULL;
     }
 
     /* Refuse if no PCI device was bound at Init. */
     if (!base->pciDevice) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        base->open_last_err = IOERR_OPENFAIL;
         return NULL;
     }
 
@@ -750,6 +755,7 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
         TAG_END);
     if (!op) {
         ioreq->ios2_Req.io_Error = IOERR_OPENFAIL;
+        base->open_last_err = IOERR_OPENFAIL;
         return NULL;
     }
     op->base        = base;
@@ -800,6 +806,7 @@ BPTR _manager_Close(struct DeviceManagerInterface *Self,
 {
     struct Rtl8139ReBase *base = (struct Rtl8139ReBase *)Self->Data.LibBase;
     struct Rtl8139Opener *op = (struct Rtl8139Opener *)ioreq->ios2_Req.io_Unit;
+    base->close_count++;
 
     /* Detach the opener + abort any pending CMD_READs so callers
      * unblock. Then free. Guard the list mutation with io_lock. */
@@ -1036,6 +1043,12 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         base->tx_last_wire = len;
         break;
     }
+    case 0xE005: {  /* Private DBG_OPENTRACE — Open/Close counters */
+        ioreq->ios2_DataLength = base->open_count;
+        ioreq->ios2_WireError  = base->close_count;
+        ioreq->ios2_PacketType = base->open_last_err;
+        break;
+    }
     case 0xE004: {  /* Private DBG_BIOTRACE — dump BeginIO call trace */
         /* Dump last 8 cmd codes, oldest first. If count < 8, start
          * from index 0 (ring not full yet). If count >= 8, start at
@@ -1181,21 +1194,31 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         return;
     }
     case S2_DEVICEQUERY: {
+        /* SANA-II lets the caller supply a partial buffer — some
+         * older Roadshow versions allocate only the fields through
+         * HardwareType (no RawMTU). Fill each field only if the
+         * caller has room for it, and report SizeSupplied as MIN
+         * of SizeAvailable and our full struct. Rejecting on
+         * "too small" (as we used to) makes Roadshow close+abandon
+         * the interface. */
         struct Sana2DeviceQuery *q =
             (struct Sana2DeviceQuery *)ioreq->ios2_StatData;
-        if (!q || q->SizeAvailable < sizeof(*q)) {
+        if (!q) {
             ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
             ioreq->ios2_WireError    = S2WERR_NULL_POINTER;
-        } else {
-            q->SizeSupplied   = sizeof(*q);
-            q->DevQueryFormat = 0;
-            q->DeviceLevel    = 0;
-            q->AddrFieldSize  = 48;               /* 48-bit MAC */
-            q->MTU            = 1500;
-            q->BPS            = 100 * 1000 * 1000;/* 100 Mbps rtl8139c */
-            q->HardwareType   = S2WireType_Ethernet;
-            q->RawMTU         = 1514;             /* MTU + eth header */
+            break;
         }
+        ULONG avail = q->SizeAvailable;
+        ULONG filled = 4;   /* SizeAvailable already there */
+        if (avail >= 8)  { q->SizeSupplied   = 0; filled = 8; }
+        if (avail >= 12) { q->DevQueryFormat = 0; filled = 12; }
+        if (avail >= 16) { q->DeviceLevel    = 0; filled = 16; }
+        if (avail >= 20) { q->AddrFieldSize  = 48; filled = 20; }
+        if (avail >= 24) { q->MTU            = 1500; filled = 24; }
+        if (avail >= 28) { q->BPS            = 100 * 1000 * 1000; filled = 28; }
+        if (avail >= 32) { q->HardwareType   = S2WireType_Ethernet; filled = 32; }
+        if (avail >= 36) { q->RawMTU         = 1514; filled = 36; }
+        if (avail >= 8) q->SizeSupplied = filled;
         break;
     }
     case S2_GETGLOBALSTATS: {
