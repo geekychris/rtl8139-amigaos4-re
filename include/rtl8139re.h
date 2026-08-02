@@ -163,10 +163,15 @@ struct Rtl8139ReBase
     UBYTE              cr_after_re_rewrite; /* after 2nd write of TE|RE */
 };
 
-/* SANA-II copy hooks. Client passes function pointers via a TagItem
- * array anchored at ios2_BufferManagement on OpenDevice. See
- * devices/sana2.h S2_CopyToBuff / S2_CopyFromBuff tag IDs. */
-typedef BOOL (*Rtl8139CopyHook)(APTR to, APTR from, LONG size);
+/* SANA-II Rev 4 has two CopyTo/FromBuff ABIs — see virte1000 for the
+ * long-form explanation. Classic S2_CopyToBuff = m68k asm fn ptr, on
+ * OS4 called directly. S2_CopyToBuff16/32 = struct Hook* invoked via
+ * IUtility->CallHookPkt with a SANA2CopyHookMsg. Roadshow supplies
+ * one or the other (or both) via TagItems on ios2_BufferManagement;
+ * we prefer Hook-style (16/32) because that's what Roadshow's own
+ * TX/RX path uses. Calling the classic ptr as a Hook* jumps into
+ * garbage (DSI). */
+typedef BOOL (*Rtl8139CopyFn)(APTR to, APTR from, ULONG size);
 
 /* Per-opener state — created by _manager_Open, destroyed by _Close.
  * The client's io_Unit is set to point at this so BeginIO can find
@@ -176,11 +181,14 @@ struct Rtl8139Opener {
     struct MsgPort    *reply_port;   /* client's replyport for signals */
     ULONG              packet_type;  /* set by S2_CONFIGINTERFACE */
     struct List        pending_reads;/* CMD_READ ioreqs waiting for RX */
-    /* Client-supplied copy hooks. If NULL, fall back to inline memcpy.
-     * copy_to_buff: driver → client (used on RX)
-     * copy_from_buff: client → driver (used on TX) */
-    Rtl8139CopyHook    copy_to_buff;
-    Rtl8139CopyHook    copy_from_buff;
+    /* Copy hooks — either NULL (fall back to memcpy), a classic fn
+     * pointer (call as Rtl8139CopyFn), or a struct Hook* (call via
+     * CallHookPkt). copy_to_tag/copy_from_tag tell us which flavor
+     * the client supplied so dispatch knows. */
+    APTR               copy_to_buff;
+    APTR               copy_from_buff;
+    ULONG              copy_to_tag;   /* S2_CopyToBuff / 16 / 32 or 0 */
+    ULONG              copy_from_tag;
     ULONG              stat_rx_pkts;
     ULONG              stat_tx_pkts;
     ULONG              stat_rx_bytes;

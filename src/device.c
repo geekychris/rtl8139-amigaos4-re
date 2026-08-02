@@ -215,19 +215,31 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
             UWORD copy = deliver_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            /* Use opener's copy_to_buff hook if registered (Roadshow
-             * requires this — direct memcpy to ios2_Data writes into
-             * uninitialized memory). Fall back to memcpy for RAW
-             * clients (testrxpkt) that don't register a hook. */
+            /* Dispatch by copy_to_tag — classic direct-call vs Hook*
+             * via CallHookPkt. See CMD_WRITE for details. */
+            BOOL copy_ok = TRUE;
             if (chosen && chosen->copy_to_buff) {
-                if (!chosen->copy_to_buff(target->ios2_Data, deliver_from, (LONG)copy)) {
-                    target->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-                    target->ios2_WireError    = S2WERR_BUFF_ERROR;
-                    chosen->stat_dropped++;
+                if (chosen->copy_to_tag == S2_CopyToBuff) {
+                    Rtl8139CopyFn fn = (Rtl8139CopyFn)chosen->copy_to_buff;
+                    copy_ok = fn(target->ios2_Data, deliver_from, copy);
+                } else {
+                    struct SANA2CopyHookMsg msg;
+                    msg.schm_Method  = chosen->copy_to_tag;
+                    msg.schm_MsgSize = sizeof(msg);
+                    msg.schm_To      = target->ios2_Data;
+                    msg.schm_From    = deliver_from;
+                    msg.schm_Size    = copy;
+                    copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
+                        (struct Hook *)chosen->copy_to_buff, target, &msg);
                 }
             } else {
                 UBYTE *dst = (UBYTE *)target->ios2_Data;
                 for (UWORD b = 0; b < copy; b++) dst[b] = deliver_from[b];
+            }
+            if (!copy_ok) {
+                target->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                target->ios2_WireError    = S2WERR_BUFF_ERROR;
+                if (chosen) chosen->stat_dropped++;
             }
             target->ios2_DataLength = copy;
             for (int a = 0; a < 6; a++) {
@@ -774,26 +786,40 @@ struct Rtl8139ReBase *_manager_Open(struct DeviceManagerInterface *Self,
     op->copy_from_buff = NULL;
     base->IExec->NewList(&op->pending_reads);
 
-    /* Parse SANA-II buffer-management tags. The Roadshow convention:
-     * client sets ios2_BufferManagement to a TagItem array before
-     * OpenDevice, listing the copy-hook function pointers. If NULL
-     * or missing, driver falls back to inline byte copy in
-     * rtl_rx_drain and CMD_WRITE. */
-    if (ioreq->ios2_BufferManagement) {
-        struct TagItem *tags = (struct TagItem *)ioreq->ios2_BufferManagement;
-        struct TagItem *t;
-        struct TagItem *iter = tags;
-        while ((t = base->IUtility->NextTagItem(&iter)) != NULL) {
-            switch (t->ti_Tag) {
-            case S2_CopyToBuff:
-                op->copy_to_buff = (Rtl8139CopyHook)t->ti_Data;
-                break;
-            case S2_CopyFromBuff:
-                op->copy_from_buff = (Rtl8139CopyHook)t->ti_Data;
-                break;
-            default:
-                break;   /* ignore unknown; PacketFilter/16/32 variants TBD */
-            }
+    /* Parse SANA-II buffer-management tags. Roadshow supplies
+     * ios2_BufferManagement as a pointer to a TagItem array holding
+     * one or more of:
+     *   S2_CopyToBuff32   Hook* preferred (byte or 32-bit aligned)
+     *   S2_CopyToBuff16   Hook* fallback (16-bit aligned)
+     *   S2_CopyToBuff     classic fn ptr fallback
+     * (and same for CopyFromBuff). We prefer the Hook-style variants
+     * because classic-vs-Hook ABIs are incompatible — calling a
+     * Hook* as a fn pointer jumps 8 bytes into the struct → DSI. */
+    if (ioreq->ios2_BufferManagement && base->IUtility) {
+        struct TagItem *tags =
+            (struct TagItem *)ioreq->ios2_BufferManagement;
+        struct UtilityIFace *iu = base->IUtility;
+
+        op->copy_to_buff = (APTR)iu->GetTagData(S2_CopyToBuff32, 0, tags);
+        op->copy_to_tag  = op->copy_to_buff ? S2_CopyToBuff32 : 0;
+        if (!op->copy_to_buff) {
+            op->copy_to_buff = (APTR)iu->GetTagData(S2_CopyToBuff16, 0, tags);
+            op->copy_to_tag  = op->copy_to_buff ? S2_CopyToBuff16 : 0;
+        }
+        if (!op->copy_to_buff) {
+            op->copy_to_buff = (APTR)iu->GetTagData(S2_CopyToBuff, 0, tags);
+            op->copy_to_tag  = op->copy_to_buff ? S2_CopyToBuff : 0;
+        }
+
+        op->copy_from_buff = (APTR)iu->GetTagData(S2_CopyFromBuff32, 0, tags);
+        op->copy_from_tag  = op->copy_from_buff ? S2_CopyFromBuff32 : 0;
+        if (!op->copy_from_buff) {
+            op->copy_from_buff = (APTR)iu->GetTagData(S2_CopyFromBuff16, 0, tags);
+            op->copy_from_tag  = op->copy_from_buff ? S2_CopyFromBuff16 : 0;
+        }
+        if (!op->copy_from_buff) {
+            op->copy_from_buff = (APTR)iu->GetTagData(S2_CopyFromBuff, 0, tags);
+            op->copy_from_tag  = op->copy_from_buff ? S2_CopyFromBuff : 0;
         }
     }
 
@@ -1007,20 +1033,32 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         UBYTE *payload_dst = dst + 14;
         ULONG frame_len    = 14 + len;
 
-        /* Roadshow provides ios2_Data via a copy hook, not as a directly-
-         * dereferenceable pointer. Reading it as memory gives us
-         * uninitialized junk (valid ETH header, garbage payload).
-         * If the opener registered a copy_from_buff hook, use it;
-         * else fall back to memcpy for RAW-style clients (testtx). */
+        /* Dispatch by tag flavor: classic S2_CopyFromBuff = direct fn
+         * call; 16/32 variants = CallHookPkt with SANA2CopyHookMsg.
+         * NULL = fall back to memcpy (RAW clients like testtx). */
+        BOOL copy_ok = TRUE;
         if (tx_op && tx_op->copy_from_buff) {
-            if (!tx_op->copy_from_buff(payload_dst, ioreq->ios2_Data, (LONG)len)) {
-                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
-                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
-                break;
+            if (tx_op->copy_from_tag == S2_CopyFromBuff) {
+                Rtl8139CopyFn fn = (Rtl8139CopyFn)tx_op->copy_from_buff;
+                copy_ok = fn(payload_dst, ioreq->ios2_Data, len);
+            } else {
+                struct SANA2CopyHookMsg msg;
+                msg.schm_Method  = tx_op->copy_from_tag;
+                msg.schm_MsgSize = sizeof(msg);
+                msg.schm_To      = payload_dst;
+                msg.schm_From    = ioreq->ios2_Data;
+                msg.schm_Size    = len;
+                copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
+                    (struct Hook *)tx_op->copy_from_buff, ioreq, &msg);
             }
         } else {
             UBYTE *src = (UBYTE *)ioreq->ios2_Data;
             for (ULONG i = 0; i < len; i++) payload_dst[i] = src[i];
+        }
+        if (!copy_ok) {
+            ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+            ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+            break;
         }
         for (ULONG i = frame_len; i < 60; i++) dst[i] = 0;
         if (frame_len < 60) frame_len = 60;
