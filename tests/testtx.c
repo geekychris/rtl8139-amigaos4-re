@@ -35,26 +35,30 @@ int main(int argc, char **argv)
         return 20;
     }
 
-    /* Build a broadcast ARP request (60-byte minimum Ethernet frame).
-     * Ethernet: dst=FF*6, src=52:54:00:12:34:59, type=0806 (ARP)
-     * ARP: HW type=1 (Ethernet), Proto=0800, HW/Proto len=6/4,
-     *      Op=1 (request), then sender+target MAC/IP fields. */
-    UBYTE frame[60];
-    for (int i = 0; i < 60; i++) frame[i] = 0;
-    for (int i = 0; i < 6; i++) frame[i] = 0xFF;   /* dst broadcast */
-    frame[6]  = 0x52; frame[7]  = 0x54;  /* src MAC */
-    frame[8]  = 0x00; frame[9]  = 0x12;
-    frame[10] = 0x34; frame[11] = 0x59;
-    frame[12] = 0x08; frame[13] = 0x06;  /* Ethertype ARP */
-    frame[14] = 0x00; frame[15] = 0x01;  /* HW=Ethernet */
-    frame[16] = 0x08; frame[17] = 0x00;  /* Proto=IPv4 */
-    frame[18] = 0x06; frame[19] = 0x04;  /* len 6/4 */
-    frame[20] = 0x00; frame[21] = 0x01;  /* op=request */
+    /* Cooked-mode ARP request: payload only (no ETH header — driver
+     * builds that from ios2_DstAddr + ios2_PacketType).
+     * ARP body: HW type=1 (Ethernet), Proto=0800, HW/Proto len=6/4,
+     *           Op=1 (request), then sender+target MAC/IP fields. */
+    UBYTE arp[28];
+    for (int i = 0; i < 28; i++) arp[i] = 0;
+    arp[0]  = 0x00; arp[1]  = 0x01;   /* HW=Ethernet */
+    arp[2]  = 0x08; arp[3]  = 0x00;   /* Proto=IPv4 */
+    arp[4]  = 0x06; arp[5]  = 0x04;   /* len 6/4 */
+    arp[6]  = 0x00; arp[7]  = 0x01;   /* op=request */
+    /* Sender MAC bytes 8..13 = our MAC (rtl8139re's), 14..17 = 0.0.0.0
+     * Target MAC 18..23 = 0, IP 24..27 = 0.0.0.1 (arbitrary). */
+    arp[8]  = 0x52; arp[9]  = 0x54;
+    arp[10] = 0x00; arp[11] = 0x12;
+    arp[12] = 0x34; arp[13] = 0x59;
+    arp[27] = 0x01;
 
+    /* Broadcast MAC in DstAddr; ARP ethertype in PacketType. */
+    for (int i = 0; i < 6; i++) req->ios2_DstAddr[i] = 0xFF;
+    req->ios2_PacketType     = 0x0806;   /* ARP */
     req->ios2_Req.io_Command = CMD_WRITE;
     req->ios2_Req.io_Error   = 0;
-    req->ios2_DataLength     = 60;
-    req->ios2_Data           = (APTR)frame;
+    req->ios2_DataLength     = 28;
+    req->ios2_Data           = (APTR)arp;
 
     LONG rc = IExec->DoIO((struct IORequest *)req);
     IDOS->Printf("CMD_WRITE: DoIO=%ld io_Error=%ld wire=0x%lx\n",

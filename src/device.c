@@ -215,8 +215,17 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
             UWORD copy = deliver_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            /* TEMP: always memcpy, bypass copy hook. */
-            {
+            /* Use opener's copy_to_buff hook if registered (Roadshow
+             * requires this — direct memcpy to ios2_Data writes into
+             * uninitialized memory). Fall back to memcpy for RAW
+             * clients (testrxpkt) that don't register a hook. */
+            if (chosen && chosen->copy_to_buff) {
+                if (!chosen->copy_to_buff(target->ios2_Data, deliver_from, (LONG)copy)) {
+                    target->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                    target->ios2_WireError    = S2WERR_BUFF_ERROR;
+                    chosen->stat_dropped++;
+                }
+            } else {
                 UBYTE *dst = (UBYTE *)target->ios2_Data;
                 for (UWORD b = 0; b < copy; b++) dst[b] = deliver_from[b];
             }
@@ -966,44 +975,53 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         UBYTE *dst = (UBYTE *)base->tx_buffer + (slot * RTL_TX_BUF_SIZE);
         ULONG dst_phys = base->tx_buffer_phys + (slot * RTL_TX_BUF_SIZE);
 
-        /* MODE DETECTION: SANA-II supports RAW (client supplies full
-         * Ethernet frame in ios2_Data) and COOKED (client supplies
-         * payload only + ios2_DstAddr + ios2_PacketType). io_Flags's
-         * SANA2IOF_RAW gets wiped by DoIO on this stack, so use
-         * PacketType as the heuristic: nonzero = cooked, zero = raw.
-         * testtx sends raw (PacketType=0), Roadshow sends cooked. */
+        /* SANA-II cooked TX: client supplies payload + ios2_DstAddr +
+         * ios2_PacketType. Driver builds Ethernet header.
+         * S2_BROADCAST forces dst = FF:FF:FF:FF:FF:FF. Prior attempt
+         * at raw/cooked heuristic (nonzero PacketType => cooked) was
+         * fragile; standard SANA-II clients (Roadshow, bsdsocket) are
+         * always cooked, so make that the default. */
         struct Rtl8139Opener *tx_op = (struct Rtl8139Opener *)
             ioreq->ios2_Req.io_Unit;
-        BOOL cooked = (ioreq->ios2_PacketType != 0);
-        UBYTE *payload_dst;
-        ULONG frame_len;
-
-        if (cooked) {
-            /* Build ETH header from request fields. */
-            if (ioreq->ios2_Req.io_Command == S2_BROADCAST) {
+        if (ioreq->ios2_Req.io_Command == S2_BROADCAST) {
+            for (int i = 0; i < 6; i++) dst[i] = 0xFF;
+        } else {
+            /* If ios2_DstAddr is all-zeros, treat as broadcast — this
+             * matches shipping rtl8139.device behavior on Roadshow's
+             * pre-ARP-resolution CMD_WRITE calls. Without this the
+             * SLIRP gateway drops our packets and never replies with
+             * ARP, so Roadshow never gets to resolve the real MAC. */
+            BOOL all_zero = TRUE;
+            for (int i = 0; i < 6; i++) {
+                if (ioreq->ios2_DstAddr[i]) { all_zero = FALSE; break; }
+            }
+            if (all_zero) {
                 for (int i = 0; i < 6; i++) dst[i] = 0xFF;
             } else {
                 for (int i = 0; i < 6; i++) dst[i] = ioreq->ios2_DstAddr[i];
             }
-            for (int i = 0; i < 6; i++) dst[6 + i] = base->mac[i];
-            dst[12] = (UBYTE)((ioreq->ios2_PacketType >> 8) & 0xFF);
-            dst[13] = (UBYTE)( ioreq->ios2_PacketType       & 0xFF);
-            payload_dst = dst + 14;
-            frame_len   = 14 + len;
-        } else {
-            /* Raw: client's data starts with ETH header. */
-            payload_dst = dst;
-            frame_len   = len;
         }
+        for (int i = 0; i < 6; i++) dst[6 + i] = base->mac[i];
+        dst[12] = (UBYTE)((ioreq->ios2_PacketType >> 8) & 0xFF);
+        dst[13] = (UBYTE)( ioreq->ios2_PacketType       & 0xFF);
+        UBYTE *payload_dst = dst + 14;
+        ULONG frame_len    = 14 + len;
 
-        /* TEMP: bypass copy hooks — Roadshow's hook signature/semantics
-         * may differ from our assumption; always memcpy. Revisit once
-         * ping via Roadshow works. */
-        {
+        /* Roadshow provides ios2_Data via a copy hook, not as a directly-
+         * dereferenceable pointer. Reading it as memory gives us
+         * uninitialized junk (valid ETH header, garbage payload).
+         * If the opener registered a copy_from_buff hook, use it;
+         * else fall back to memcpy for RAW-style clients (testtx). */
+        if (tx_op && tx_op->copy_from_buff) {
+            if (!tx_op->copy_from_buff(payload_dst, ioreq->ios2_Data, (LONG)len)) {
+                ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+                ioreq->ios2_WireError    = S2WERR_BUFF_ERROR;
+                break;
+            }
+        } else {
             UBYTE *src = (UBYTE *)ioreq->ios2_Data;
             for (ULONG i = 0; i < len; i++) payload_dst[i] = src[i];
         }
-        (void)tx_op;
         for (ULONG i = frame_len; i < 60; i++) dst[i] = 0;
         if (frame_len < 60) frame_len = 60;
         len = frame_len;   /* wire length that goes to the chip */
