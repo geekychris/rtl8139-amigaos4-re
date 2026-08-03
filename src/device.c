@@ -215,23 +215,19 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
             UWORD copy = deliver_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            /* Per-tag copy_to_buff dispatch (classic direct-call vs
-             * Hook*). sana2_hook path removed after GrimReaper. */
+            /* Per Bill Borsari's fix: ALWAYS use CallHookPkt (see
+             * CMD_WRITE for the rationale — classic S2_CopyToBuff
+             * is also a Hook* on OS4, not a raw fn ptr). */
             BOOL copy_ok = TRUE;
-            if (chosen && chosen->copy_to_buff) {
-                if (chosen->copy_to_tag == S2_CopyToBuff) {
-                    Rtl8139CopyFn fn = (Rtl8139CopyFn)chosen->copy_to_buff;
-                    copy_ok = fn(target->ios2_Data, deliver_from, copy);
-                } else {
-                    struct SANA2CopyHookMsg msg;
-                    msg.schm_Method  = chosen->copy_to_tag;
-                    msg.schm_MsgSize = sizeof(msg);
-                    msg.schm_To      = target->ios2_Data;
-                    msg.schm_From    = deliver_from;
-                    msg.schm_Size    = copy;
-                    copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
-                        (struct Hook *)chosen->copy_to_buff, target, &msg);
-                }
+            if (chosen && chosen->copy_to_buff && base->IUtility) {
+                struct SANA2CopyHookMsg msg;
+                msg.schm_Method  = chosen->copy_to_tag;
+                msg.schm_MsgSize = sizeof(msg);
+                msg.schm_To      = target->ios2_Data;
+                msg.schm_From    = deliver_from;
+                msg.schm_Size    = copy;
+                copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
+                    (struct Hook *)chosen->copy_to_buff, target, &msg);
             } else {
                 UBYTE *dst = (UBYTE *)target->ios2_Data;
                 for (UWORD b = 0; b < copy; b++) dst[b] = deliver_from[b];
@@ -1033,23 +1029,22 @@ void _manager_BeginIO(struct DeviceManagerInterface *Self,
         UBYTE *payload_dst = dst + 14;
         ULONG frame_len    = 14 + len;
 
-        /* Dispatch by tag flavor: classic direct-call vs Hook* via
-         * CallHookPkt. sana2_hook path removed after GrimReaper. */
+        /* Per Bill Borsari's amiga-e1000-driver fix c0fc9e7: ALWAYS
+         * invoke Copy* hooks via CallHookPkt, including the "classic"
+         * S2_CopyFromBuff tag. Even the classic tag on OS4 points at
+         * a struct Hook*, not a raw fn ptr — calling as a fn jumps
+         * 8 bytes into the struct → ISI exception + garbage payload.
+         * The tag distinguishes only the schm_Method field. */
         BOOL copy_ok = TRUE;
-        if (tx_op && tx_op->copy_from_buff) {
-            if (tx_op->copy_from_tag == S2_CopyFromBuff) {
-                Rtl8139CopyFn fn = (Rtl8139CopyFn)tx_op->copy_from_buff;
-                copy_ok = fn(payload_dst, ioreq->ios2_Data, len);
-            } else {
-                struct SANA2CopyHookMsg msg;
-                msg.schm_Method  = tx_op->copy_from_tag;
-                msg.schm_MsgSize = sizeof(msg);
-                msg.schm_To      = payload_dst;
-                msg.schm_From    = ioreq->ios2_Data;
-                msg.schm_Size    = len;
-                copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
-                    (struct Hook *)tx_op->copy_from_buff, ioreq, &msg);
-            }
+        if (tx_op && tx_op->copy_from_buff && base->IUtility) {
+            struct SANA2CopyHookMsg msg;
+            msg.schm_Method  = tx_op->copy_from_tag;
+            msg.schm_MsgSize = sizeof(msg);
+            msg.schm_To      = payload_dst;
+            msg.schm_From    = ioreq->ios2_Data;
+            msg.schm_Size    = len;
+            copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
+                (struct Hook *)tx_op->copy_from_buff, ioreq, &msg);
         } else {
             UBYTE *src = (UBYTE *)ioreq->ios2_Data;
             for (ULONG i = 0; i < len; i++) payload_dst[i] = src[i];
