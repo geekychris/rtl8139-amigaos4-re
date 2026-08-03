@@ -215,20 +215,15 @@ static void rtl_rx_drain(struct Rtl8139ReBase *base)
             UWORD copy = deliver_len;
             if (target->ios2_DataLength > 0 && copy > target->ios2_DataLength)
                 copy = (UWORD)target->ios2_DataLength;
-            /* Per Bill Borsari's fix: ALWAYS use CallHookPkt (see
-             * CMD_WRITE for the rationale — classic S2_CopyToBuff
-             * is also a Hook* on OS4, not a raw fn ptr). */
+            /* RX rollback (post part-21): the always-CallHookPkt
+             * approach that works on TX freezes the whole guest on
+             * the first inbound frame (unit-task context vs a hook
+             * pointer we haven't proven is a Hook* on this opener).
+             * Fall back to raw memcpy. ARP openers typically don't
+             * install custom BM, so this covers the ping case;
+             * revisit when we understand which openers install what. */
             BOOL copy_ok = TRUE;
-            if (chosen && chosen->copy_to_buff && base->IUtility) {
-                struct SANA2CopyHookMsg msg;
-                msg.schm_Method  = chosen->copy_to_tag;
-                msg.schm_MsgSize = sizeof(msg);
-                msg.schm_To      = target->ios2_Data;
-                msg.schm_From    = deliver_from;
-                msg.schm_Size    = copy;
-                copy_ok = (BOOL)(ULONG)base->IUtility->CallHookPkt(
-                    (struct Hook *)chosen->copy_to_buff, target, &msg);
-            } else {
+            {
                 UBYTE *dst = (UBYTE *)target->ios2_Data;
                 for (UWORD b = 0; b < copy; b++) dst[b] = deliver_from[b];
             }
