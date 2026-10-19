@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Rtl8139 Amigaos4 Re logo" width="180">
+</p>
+
 # rtl8139re.device
 
 AmigaOS 4 SANA-II network device driver for the Realtek RTL8139 family.
